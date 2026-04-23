@@ -1186,8 +1186,34 @@ def main() -> None:
                 # Already done — don't run --create-sp again later.
                 args.create_sp = False
         if not args.create_table and Confirm.ask("Create the target table now?", default=False):
-            args.create_table = True
-            logger.info("user opted into --create-table at first-run prompt")
+            logger.info("user opted to create table inline at first-run prompt")
+            if not cfg.profile:
+                say(
+                    "[red]Cannot create a table without a Databricks CLI profile.[/red]",
+                    level=logging.ERROR,
+                )
+            else:
+                if not cfg.schema_file:
+                    default_schema = str(SCRIPT_DIR / "sample_schema.json")
+                    cfg.schema_file = Prompt.ask(
+                        "Path to data structure JSON", default=default_schema,
+                    )
+                if not cfg.table_name:
+                    cfg.table_name = Prompt.ask(
+                        "Full table name (catalog.schema.table)",
+                        default=cfg.table_name or None,
+                    ) or ""
+                if not cfg.schema_file or not cfg.table_name:
+                    say(
+                        "[red]Both schema file and table name are required — skipping table creation.[/red]",
+                        level=logging.ERROR,
+                    )
+                else:
+                    create_table(cfg)
+                    save_last_values(cfg)
+                    log_config(cfg, "config after inline table creation")
+                    # Already done — don't run --create-table again later.
+                    args.create_table = False
 
     interactive = args.interactive or (
         not args.config and not args.non_interactive and bool(missing_required(cfg))

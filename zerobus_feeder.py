@@ -151,40 +151,73 @@ def list_cli_profiles() -> list[str]:
     return profiles
 
 
+def _read_profile_raw(profile: str) -> dict:
+    """Read a single profile from ~/.databrickscfg without touching the SDK
+    (so unauthenticated profiles don't raise auth errors just for lookup).
+
+    configparser inherits [DEFAULT] values into every section, which would
+    silently give unrelated profiles a DEFAULT workspace_id. We parse the file
+    manually so each section only returns keys it explicitly lists.
+    """
+    if not DATABRICKS_CFG.exists():
+        return {}
+    sections: dict[str, dict] = {}
+    current: Optional[str] = None
+    try:
+        with DATABRICKS_CFG.open() as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#") or s.startswith(";"):
+                    continue
+                if s.startswith("[") and s.endswith("]"):
+                    current = s[1:-1].strip()
+                    sections.setdefault(current, {})
+                    continue
+                if current and "=" in s:
+                    k, _, v = s.partition("=")
+                    sections[current][k.strip()] = v.strip()
+    except Exception:
+        return {}
+    return sections.get(profile, {})
+
+
+def _workspace_id_from_host(host: str) -> Optional[str]:
+    """Azure workspace URLs embed the workspace id: adb-<id>.<n>.azuredatabricks.net."""
+    import re
+    m = re.search(r"adb-(\d+)\.", host or "")
+    return m.group(1) if m else None
+
+
 def enrich_from_profile(cfg: Config) -> None:
     if not cfg.profile:
         return
-    try:
-        from databricks.sdk import WorkspaceClient
-    except ImportError:
-        console.print("[yellow]databricks-sdk not installed; skipping profile enrichment.[/yellow]")
+    raw = _read_profile_raw(cfg.profile)
+    if not cfg.workspace_url and raw.get("host"):
+        cfg.workspace_url = raw["host"].rstrip("/")
+        console.print(f"[dim]Prefilled workspace_url from profile: {cfg.workspace_url}[/dim]")
+    if not cfg.workspace_id:
+        wid = raw.get("workspace_id") or _workspace_id_from_host(raw.get("host", ""))
+        if wid:
+            cfg.workspace_id = str(wid)
+            console.print(f"[dim]Prefilled workspace_id from profile: {wid}[/dim]")
+    # If something is still missing, try the SDK as a best-effort fallback.
+    # Stay quiet on auth failures — the user may just not be logged in yet.
+    if cfg.workspace_url and cfg.workspace_id:
         return
     try:
+        from databricks.sdk import WorkspaceClient
         w = WorkspaceClient(profile=cfg.profile)
         if not cfg.workspace_url and w.config.host:
             cfg.workspace_url = w.config.host.rstrip("/")
-            console.print(f"[dim]Prefilled workspace_url from profile: {cfg.workspace_url}[/dim]")
         if not cfg.workspace_id:
-            wid = _resolve_workspace_id(w)
-            if wid:
-                cfg.workspace_id = wid
-                console.print(f"[dim]Prefilled workspace_id from profile: {wid}[/dim]")
-    except Exception as e:
-        console.print(f"[yellow]Could not read profile '{cfg.profile}': {e}[/yellow]")
-
-
-def _resolve_workspace_id(w) -> Optional[str]:
-    # config.workspace_id is populated on some platforms (Azure host pattern).
-    wid = getattr(w.config, "workspace_id", None)
-    if wid:
-        return str(wid)
-    try:
-        ma = w.metastores.current()
-        if ma and getattr(ma, "workspace_id", None):
-            return str(ma.workspace_id)
+            try:
+                ma = w.metastores.current()
+                if ma and getattr(ma, "workspace_id", None):
+                    cfg.workspace_id = str(ma.workspace_id)
+            except Exception:
+                pass
     except Exception:
         pass
-    return None
 
 
 # ----------------------------------------------------- Interactive wizard ----
@@ -802,4 +835,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Aborted by user.[/yellow]")
+        sys.exit(130)
+    except EOFError:
+        # Ctrl+D at an interactive prompt.
+        console.print("\n[yellow]Input closed; aborting.[/yellow]")
+        sys.exit(130)

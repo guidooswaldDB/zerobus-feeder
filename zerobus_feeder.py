@@ -516,20 +516,48 @@ class DataGenerator:
 # ----------------------------------------------------------- Stats / UI ----
 
 class Stats:
-    def __init__(self, history: int = 240):
+    """Per-record stats plus per-second aggregation buckets (avg + max)."""
+
+    def __init__(self, history_secs: int = 600):
         self.sent = 0
         self.errors = 0
         self.started = time.time()
-        self.hist = deque(maxlen=history)
-        self.window = deque(maxlen=2000)
+        self.window = deque(maxlen=2000)  # for percentiles
+        self.last_latency = 0.0
         self.last_error: str = ""
         self._lock = threading.Lock()
 
+        # Per-second rolling history of (avg_ms, max_ms).
+        self.bucket_start = int(self.started)
+        self.cur_count = 0
+        self.cur_sum = 0.0
+        self.cur_max = 0.0
+        self.hist = deque(maxlen=history_secs)
+
+    def _roll(self, now: float) -> None:
+        """Flush finished 1-second buckets into hist."""
+        now_sec = int(now)
+        while self.bucket_start < now_sec:
+            if self.cur_count > 0:
+                avg = self.cur_sum / self.cur_count
+                self.hist.append((avg, self.cur_max))
+            else:
+                self.hist.append((0.0, 0.0))
+            self.bucket_start += 1
+            self.cur_count = 0
+            self.cur_sum = 0.0
+            self.cur_max = 0.0
+
     def record_ok(self, latency_ms: float) -> None:
         with self._lock:
+            self._roll(time.time())
             self.sent += 1
-            self.hist.append(latency_ms)
             self.window.append(latency_ms)
+            self.last_latency = latency_ms
+            self.cur_count += 1
+            self.cur_sum += latency_ms
+            if latency_ms > self.cur_max:
+                self.cur_max = latency_ms
 
     def record_error(self, message: str) -> None:
         with self._lock:
@@ -538,7 +566,14 @@ class Stats:
 
     def snapshot(self) -> dict:
         with self._lock:
-            elapsed = max(1e-9, time.time() - self.started)
+            now = time.time()
+            self._roll(now)
+            elapsed = max(1e-9, now - self.started)
+            # Include the in-flight partial bucket so the rightmost bar
+            # grows in place instead of only appearing at the 1s tick.
+            hist = list(self.hist)
+            if self.cur_count > 0:
+                hist.append((self.cur_sum / self.cur_count, self.cur_max))
             window = sorted(self.window)
             n = len(window)
 
@@ -547,84 +582,112 @@ class Stats:
                     return 0.0
                 return window[min(n - 1, int(n * p))]
 
+            # Last full bucket's avg/max (fallback to in-flight if no full one yet).
+            if self.hist:
+                last_avg, last_max = self.hist[-1]
+            elif self.cur_count > 0:
+                last_avg, last_max = self.cur_sum / self.cur_count, self.cur_max
+            else:
+                last_avg = last_max = 0.0
+
             return {
                 "sent": self.sent,
                 "errors": self.errors,
                 "elapsed": elapsed,
                 "qps_actual": self.sent / elapsed,
                 "last_error": self.last_error,
-                "cur": self.hist[-1] if self.hist else 0.0,
+                "cur": self.last_latency,
+                "last_avg": last_avg,
+                "last_max": last_max,
                 "min": window[0] if n else 0.0,
                 "max": window[-1] if n else 0.0,
                 "p50": pct(0.50),
                 "p95": pct(0.95),
                 "p99": pct(0.99),
-                "history": list(self.hist),
+                "history": hist,  # list[(avg_ms, max_ms)], one per second
             }
 
 
 _BAR_BLOCKS = (" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█")
 _LEVELS_PER_ROW = len(_BAR_BLOCKS) - 1  # 8
 
+AVG_STYLE = "bright_green"
+MAX_STYLE = "bright_yellow"
+
 
 def latency_graph(
-    values: list[float],
-    width: int = 80,
+    buckets: list[tuple[float, float]],
+    width: int,
     height: int = 10,
     use_log: bool = True,
-) -> tuple[list[str], float, float]:
-    """Render a multi-row vertical bar graph of recent latencies.
+) -> tuple[list[Text], float, float]:
+    """Render a per-second latency graph.
 
-    Returns (rows, y_min, y_max) where y_min/y_max are the actual latency
-    values represented by the bottom and top of the graph (not the
-    log-transformed values).
+    Each column is one second. The bar is drawn up to the second's MAX
+    latency in MAX_STYLE; the portion from 0 to that second's AVG is
+    over-painted in AVG_STYLE so both values are visible simultaneously.
+
+    Returns (styled Text rows, y_min_ms, y_max_ms).
     """
-    if not values:
+    width = max(10, int(width))
+    if not buckets:
         return [], 0.0, 0.0
 
-    if len(values) > width:
-        step = len(values) / width
-        sampled = [values[int(i * step)] for i in range(width)]
+    # Keep the most recent `width` buckets, right-aligned.
+    if len(buckets) > width:
+        data = list(buckets)[-width:]
     else:
-        sampled = list(values)
+        data = list(buckets)
+    leading_pad = width - len(data)
 
-    # Floor tiny values so log(0) is avoided and all-zero histories don't
-    # explode the range.
-    floor_ms = 0.01
-    if use_log:
-        transformed = [math.log10(max(v, floor_ms)) for v in sampled]
-    else:
-        transformed = list(sampled)
+    all_vals = [v for pair in data for v in pair if v > 0]
+    if not all_vals:
+        # Only zero-valued buckets so far; render empty rows.
+        return [Text(" " * width, style="dim") for _ in range(height)], 0.0, 0.0
 
-    t_lo = min(transformed)
-    t_hi = max(transformed)
+    def transform(v: float) -> float:
+        return math.log10(max(v, 0.01)) if use_log else v
+
+    t_vals = [transform(v) for v in all_vals]
+    t_lo = min(t_vals)
+    t_hi = max(t_vals)
     if t_hi - t_lo < 1e-9:
-        # Flat line — pad the range a little so we still show something.
         pad = 0.1 if use_log else max(1e-6, abs(t_hi) * 0.1)
         t_lo -= pad
         t_hi += pad
     rng = t_hi - t_lo
-
     total_levels = height * _LEVELS_PER_ROW
-    bar_levels = [
-        max(0, min(total_levels,
-                   int(round((v - t_lo) / rng * total_levels))))
-        for v in transformed
-    ]
 
-    rows: list[str] = []
+    def level_of(v: float) -> int:
+        if v <= 0:
+            return 0
+        return max(0, min(total_levels,
+                          int(round((transform(v) - t_lo) / rng * total_levels))))
+
+    avg_levels = [level_of(a) for (a, _) in data]
+    max_levels = [level_of(m) for (_, m) in data]
+
+    rows: list[Text] = []
     for r in range(height, 0, -1):
         lower = (r - 1) * _LEVELS_PER_ROW
         upper = r * _LEVELS_PER_ROW
-        row_chars = []
-        for h in bar_levels:
-            if h >= upper:
-                row_chars.append(_BAR_BLOCKS[_LEVELS_PER_ROW])
-            elif h <= lower:
-                row_chars.append(_BAR_BLOCKS[0])
+        mid = lower + _LEVELS_PER_ROW / 2
+        row = Text()
+        if leading_pad > 0:
+            row.append(" " * leading_pad)
+        for al, ml in zip(avg_levels, max_levels):
+            # Bar height at this column = ml (max-latency level).
+            if ml >= upper:
+                ch = _BAR_BLOCKS[_LEVELS_PER_ROW]
+            elif ml <= lower:
+                ch = _BAR_BLOCKS[0]
             else:
-                row_chars.append(_BAR_BLOCKS[h - lower])
-        rows.append("".join(row_chars))
+                ch = _BAR_BLOCKS[ml - lower]
+            # Colour: green if the middle of this row sits within the
+            # avg portion of the bar, yellow if strictly above it.
+            style = AVG_STYLE if mid <= al else MAX_STYLE
+            row.append(ch, style=style)
+        rows.append(row)
 
     y_min = (10 ** t_lo) if use_log else t_lo
     y_max = (10 ** t_hi) if use_log else t_hi
@@ -660,42 +723,60 @@ def render_dashboard(snap: dict, cfg: Config, target_qps: float) -> Panel:
     )
     stats.add_row(
         "Latency min / max:", f"{snap['min']:.2f} / {snap['max']:.2f} ms",
-        "Target:", f"{cfg.table_name}",
+        "Last-sec avg / max:",
+        f"{snap['last_avg']:.2f} / {snap['last_max']:.2f} ms",
     )
     stats.add_row(
+        "Target:", f"{cfg.table_name}",
         "Endpoint:", cfg.zerobus_endpoint() if cfg.workspace_id else "(unset)",
-        "Workspace URL:", cfg.workspace_url or "(unset)",
     )
 
     hist = snap["history"]
-    graph_width = 80
-    graph_height = 10
+    label_w = 11  # "  1234.5 ms"
+    # Use the whole terminal width minus the label column and panel chrome.
+    term_w = console.size.width or 120
+    graph_width = max(20, term_w - label_w - 4)  # 2 border chars each side
+    graph_height = 12
+
     rows, y_min, y_max = latency_graph(
         hist, width=graph_width, height=graph_height, use_log=True,
     )
-    # Prefix each row with a right-aligned Y-axis label.
-    label_w = 8  # e.g. "10000 ms"
+
+    def fmt_y(v: float) -> str:
+        if v >= 1000:
+            return f"{v:8.0f} ms"
+        if v >= 10:
+            return f"{v:8.1f} ms"
+        return f"{v:8.2f} ms"
+
     labeled_rows: list[Text] = []
     if rows:
+        mid_idx = len(rows) // 2
         for i, row in enumerate(rows):
             if i == 0:
-                label = f"{y_max:7.2f} "
+                label = fmt_y(y_max)
             elif i == len(rows) - 1:
-                label = f"{y_min:7.2f} "
+                label = fmt_y(y_min)
+            elif i == mid_idx:
+                # Geometric midpoint on a log scale.
+                mid_val = (10 ** ((math.log10(max(y_min, 0.01)) + math.log10(max(y_max, 0.01))) / 2))
+                label = fmt_y(mid_val)
             else:
                 label = " " * label_w
-            labeled_rows.append(Text(label, style="dim") + Text(row, style="green"))
+            labeled_rows.append(Text(label + " ", style="dim") + row)
     else:
         labeled_rows.append(Text("(no samples yet)", style="dim"))
 
-    axis_caption = Text(
-        f"{' ' * label_w}Latency (ms, log scale) — newest →    "
-        f"min {min(hist) if hist else 0:.1f}  "
-        f"max {max(hist) if hist else 0:.1f}  "
-        f"({len(hist)} samples)",
-        style="dim",
+    # Footer rule + legend + axis caption.
+    rule = Text(" " * label_w + " " + "─" * graph_width, style="dim")
+    legend = Text.assemble(
+        (" " * label_w + " ", "dim"),
+        ("█ avg  ", AVG_STYLE),
+        ("█ max  ", MAX_STYLE),
+        (f"log scale, 1 column = 1 s, newest →   ", "dim"),
+        (f"buckets: {len(hist)}", "dim"),
     )
-    graph_block = Group(*labeled_rows, axis_caption)
+    graph_block = Group(*labeled_rows, rule, legend)
 
     body: list[Any] = [stats, Text(""), graph_block]
     if snap["last_error"]:

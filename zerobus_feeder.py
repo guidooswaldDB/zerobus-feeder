@@ -619,7 +619,83 @@ def _workspace_client(cfg: Config):
             level=logging.ERROR)
         raise SystemExit(1)
     logger.info("constructing WorkspaceClient(profile=%s)", cfg.profile)
-    return WorkspaceClient(profile=cfg.profile)
+    try:
+        return WorkspaceClient(profile=cfg.profile)
+    except Exception as e:
+        return _handle_workspace_auth_failure(cfg, e)
+
+
+def _handle_workspace_auth_failure(cfg: "Config", original: Exception):
+    """Offer to run `databricks auth login --profile <name>` when the SDK
+    cannot authenticate, then retry the WorkspaceClient construction.
+    """
+    import shutil
+    import subprocess
+    from databricks.sdk import WorkspaceClient
+
+    msg = str(original).lower()
+    looks_like_auth = (
+        "cannot configure default credentials" in msg
+        or "default auth" in msg
+        or "databricks-cli" in msg
+        or "oauth" in msg
+        or "token" in msg
+    )
+    logger.error("WorkspaceClient construction failed: %s", original)
+    if not looks_like_auth:
+        say(f"[red]Could not initialise workspace client: {original}[/red]",
+            level=logging.ERROR)
+        raise SystemExit(1)
+
+    say(
+        f"\n[yellow]Profile '{cfg.profile}' has no active Databricks auth session.[/yellow]\n"
+        "This profile uses OAuth U2M (auth_type=databricks-cli), which needs a one-time "
+        "browser login.",
+        level=logging.WARNING,
+    )
+    if not shutil.which("databricks"):
+        say(
+            "[red]The 'databricks' CLI is not on PATH.[/red]\n"
+            "Install it (https://docs.databricks.com/dev-tools/cli/install.html) and run:\n"
+            f"  databricks auth login --profile {cfg.profile}",
+            level=logging.ERROR,
+        )
+        raise SystemExit(1)
+
+    if not Confirm.ask(
+        f"Run 'databricks auth login --profile {cfg.profile}' now (opens a browser)?",
+        default=True,
+    ):
+        say(
+            f"[yellow]Run this command manually, then re-run the feeder:[/yellow]\n"
+            f"  databricks auth login --profile {cfg.profile}",
+            level=logging.WARNING,
+        )
+        raise SystemExit(1)
+
+    logger.info("invoking 'databricks auth login --profile %s'", cfg.profile)
+    try:
+        subprocess.run(
+            ["databricks", "auth", "login", "--profile", cfg.profile],
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        logger.error("databricks auth login exit code %s", e.returncode)
+        say(f"[red]Login failed (exit code {e.returncode}).[/red]", level=logging.ERROR)
+        raise SystemExit(1)
+    except FileNotFoundError:
+        say("[red]'databricks' CLI not found after PATH check — aborting.[/red]",
+            level=logging.ERROR)
+        raise SystemExit(1)
+
+    say("[green]✓[/green] Login completed. Retrying...")
+    logger.info("retrying WorkspaceClient after auth login")
+    try:
+        return WorkspaceClient(profile=cfg.profile)
+    except Exception as e:
+        logger.exception("WorkspaceClient still failing after login")
+        say(f"[red]Still cannot authenticate: {e}[/red]", level=logging.ERROR)
+        raise SystemExit(1)
 
 
 def create_service_principal(cfg: Config) -> None:

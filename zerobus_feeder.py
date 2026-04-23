@@ -14,6 +14,7 @@ import configparser
 import getpass
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -515,7 +516,7 @@ class DataGenerator:
 # ----------------------------------------------------------- Stats / UI ----
 
 class Stats:
-    def __init__(self, history: int = 120):
+    def __init__(self, history: int = 240):
         self.sent = 0
         self.errors = 0
         self.started = time.time()
@@ -562,24 +563,72 @@ class Stats:
             }
 
 
-SPARK_BLOCKS = " ▁▂▃▄▅▆▇█"
+_BAR_BLOCKS = (" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█")
+_LEVELS_PER_ROW = len(_BAR_BLOCKS) - 1  # 8
 
 
-def sparkline(values: list[float], width: int = 80) -> str:
+def latency_graph(
+    values: list[float],
+    width: int = 80,
+    height: int = 10,
+    use_log: bool = True,
+) -> tuple[list[str], float, float]:
+    """Render a multi-row vertical bar graph of recent latencies.
+
+    Returns (rows, y_min, y_max) where y_min/y_max are the actual latency
+    values represented by the bottom and top of the graph (not the
+    log-transformed values).
+    """
     if not values:
-        return ""
+        return [], 0.0, 0.0
+
     if len(values) > width:
         step = len(values) / width
         sampled = [values[int(i * step)] for i in range(width)]
     else:
         sampled = list(values)
-    lo, hi = min(sampled), max(sampled)
-    rng = max(1e-9, hi - lo)
-    out = []
-    for v in sampled:
-        idx = int((v - lo) / rng * (len(SPARK_BLOCKS) - 1))
-        out.append(SPARK_BLOCKS[max(0, min(len(SPARK_BLOCKS) - 1, idx))])
-    return "".join(out)
+
+    # Floor tiny values so log(0) is avoided and all-zero histories don't
+    # explode the range.
+    floor_ms = 0.01
+    if use_log:
+        transformed = [math.log10(max(v, floor_ms)) for v in sampled]
+    else:
+        transformed = list(sampled)
+
+    t_lo = min(transformed)
+    t_hi = max(transformed)
+    if t_hi - t_lo < 1e-9:
+        # Flat line — pad the range a little so we still show something.
+        pad = 0.1 if use_log else max(1e-6, abs(t_hi) * 0.1)
+        t_lo -= pad
+        t_hi += pad
+    rng = t_hi - t_lo
+
+    total_levels = height * _LEVELS_PER_ROW
+    bar_levels = [
+        max(0, min(total_levels,
+                   int(round((v - t_lo) / rng * total_levels))))
+        for v in transformed
+    ]
+
+    rows: list[str] = []
+    for r in range(height, 0, -1):
+        lower = (r - 1) * _LEVELS_PER_ROW
+        upper = r * _LEVELS_PER_ROW
+        row_chars = []
+        for h in bar_levels:
+            if h >= upper:
+                row_chars.append(_BAR_BLOCKS[_LEVELS_PER_ROW])
+            elif h <= lower:
+                row_chars.append(_BAR_BLOCKS[0])
+            else:
+                row_chars.append(_BAR_BLOCKS[h - lower])
+        rows.append("".join(row_chars))
+
+    y_min = (10 ** t_lo) if use_log else t_lo
+    y_max = (10 ** t_hi) if use_log else t_hi
+    return rows, y_min, y_max
 
 
 def format_duration(seconds: float) -> str:
@@ -619,16 +668,36 @@ def render_dashboard(snap: dict, cfg: Config, target_qps: float) -> Panel:
     )
 
     hist = snap["history"]
-    spark = sparkline(hist, width=80) if hist else ""
-    scale = ""
-    if hist:
-        scale = f"min {min(hist):.1f} ms  max {max(hist):.1f} ms  (last {len(hist)} samples)"
-    spark_block = Group(
-        Text(f"Latency  {spark}", style="green"),
-        Text(scale, style="dim"),
+    graph_width = 80
+    graph_height = 10
+    rows, y_min, y_max = latency_graph(
+        hist, width=graph_width, height=graph_height, use_log=True,
     )
+    # Prefix each row with a right-aligned Y-axis label.
+    label_w = 8  # e.g. "10000 ms"
+    labeled_rows: list[Text] = []
+    if rows:
+        for i, row in enumerate(rows):
+            if i == 0:
+                label = f"{y_max:7.2f} "
+            elif i == len(rows) - 1:
+                label = f"{y_min:7.2f} "
+            else:
+                label = " " * label_w
+            labeled_rows.append(Text(label, style="dim") + Text(row, style="green"))
+    else:
+        labeled_rows.append(Text("(no samples yet)", style="dim"))
 
-    body: list[Any] = [stats, Text(""), spark_block]
+    axis_caption = Text(
+        f"{' ' * label_w}Latency (ms, log scale) — newest →    "
+        f"min {min(hist) if hist else 0:.1f}  "
+        f"max {max(hist) if hist else 0:.1f}  "
+        f"({len(hist)} samples)",
+        style="dim",
+    )
+    graph_block = Group(*labeled_rows, axis_caption)
+
+    body: list[Any] = [stats, Text(""), graph_block]
     if snap["last_error"]:
         body.append(Text(""))
         body.append(Text(f"Last error: {snap['last_error']}", style="red"))

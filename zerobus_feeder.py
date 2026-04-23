@@ -194,9 +194,49 @@ def load_yaml_config(path: str) -> dict:
     return {k: v for k, v in data.items() if k in valid}
 
 
+def _ensure_gitignored(path: Path) -> None:
+    """Append `path` (as a repo-relative entry) to the project's .gitignore
+    if it is not already listed. Only relevant when the file sits inside the
+    script directory and a .gitignore exists — otherwise silently no-op.
+    """
+    gitignore = SCRIPT_DIR / ".gitignore"
+    if not gitignore.exists():
+        return
+    try:
+        rel = str(path.resolve().relative_to(SCRIPT_DIR.resolve()))
+    except ValueError:
+        # File is outside the repo — nothing to do.
+        return
+    try:
+        existing = gitignore.read_text()
+    except Exception as e:
+        logger.warning("Could not read .gitignore: %s", e)
+        return
+    # Trivial exact-line match — don't try to interpret glob semantics.
+    lines = {ln.strip() for ln in existing.splitlines() if ln.strip() and not ln.startswith("#")}
+    if rel in lines:
+        logger.info("%s already listed in .gitignore", rel)
+        return
+    try:
+        with gitignore.open("a") as f:
+            if not existing.endswith("\n"):
+                f.write("\n")
+            f.write(
+                "\n# Generated config (contains client_secret) — do not commit\n"
+                f"{rel}\n"
+            )
+        say(f"[green]✓[/green] Added {rel} to .gitignore")
+        logger.info("appended %s to .gitignore", rel)
+    except Exception as e:
+        logger.warning("Could not update .gitignore: %s", e)
+        say(f"[yellow]Could not update .gitignore ({e}); add {rel} manually.[/yellow]",
+            level=logging.WARNING)
+
+
 def offer_config_yaml_copy(cfg: "Config") -> None:
     """Prompt the user to dump the current config (including just-created SP
-    credentials) into a reusable YAML file for `--config`.
+    credentials) into a reusable YAML file for `--config`, then ensure the
+    file is ignored by git.
     """
     if not Confirm.ask(
         "Copy the current config (including new SP credentials) to a YAML file for reuse with --config?",
@@ -218,14 +258,11 @@ def offer_config_yaml_copy(cfg: "Config") -> None:
             yaml.safe_dump(asdict(cfg), f, sort_keys=False)
         say(f"[green]✓[/green] Wrote config to {p}")
         logger.info("wrote YAML config to %s", p)
-        say(
-            f"[yellow]{p.name} contains your client_secret — add it to .gitignore "
-            f"if this is a git repo.[/yellow]",
-            level=logging.WARNING,
-        )
     except Exception as e:
         logger.exception("write YAML config failed")
         say(f"[red]Could not write {p}: {e}[/red]", level=logging.ERROR)
+        return
+    _ensure_gitignored(p)
 
 
 # ----------------------------------------------------- CLI profile helpers ----

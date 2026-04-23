@@ -1,0 +1,38 @@
+# Sample YAML config for zerobus_feeder.py.
+# When passed via --config, all other CLI parameters are ignored.
+# Any missing field will cause the script to exit with an error in non-interactive mode.
+
+# Transmission rate in records per second.
+qps: 50
+
+# Path to the JSON file describing the data structure (see sample_schema.json).
+schema_file: sample_schema.json
+
+# Zerobus endpoint is built as:
+#   AWS:   <workspace_id>.zerobus.<region>.cloud.databricks.com
+#   Azure: <workspace_id>.zerobus.<region>.azuredatabricks.net
+#   GCP:   <workspace_id>.zerobus.<region>.gcp.databricks.com
+workspace_id: "1234567890123456"
+region: us-west-2
+cloud: aws
+
+# Full target table name. Must already exist as a managed Delta table (or use --create-table).
+table_name: main.default.zerobus_feeder_events
+
+# Workspace URL used by the Zerobus SDK. Prefilled automatically from the CLI profile
+# when a profile is selected; set explicitly here if you're not using a profile.
+workspace_url: "https://dbc-xxxxxxxx-xxxx.cloud.databricks.com"
+
+# Service principal OAuth2 client credentials.
+# Run the script once with --create-sp (and --profile) to generate these.
+client_id: "00000000-0000-0000-0000-000000000000"
+client_secret: "dose_secret_here"
+
+# Optional: Databricks CLI profile, only needed for --create-sp / --create-table.
+profile: DEFAULT
+
+# Optional: SQL warehouse used by --create-table. If omitted you'll be prompted.
+warehouse_id: ""
+
+# Optional: display name used when --create-sp creates a new service principal.
+sp_display_name: zerobus-feeder

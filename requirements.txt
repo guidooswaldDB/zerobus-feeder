@@ -1,0 +1,4 @@
+databricks-zerobus-ingest-sdk>=1.0.0
+databricks-sdk>=0.30.0
+rich>=13.0.0
+PyYAML>=6.0

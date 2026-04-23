@@ -1,0 +1,70 @@
+{
+  "description": "Sample data structure for the Zerobus feeder. The 'columns' list defines the Delta table schema and how random values are generated.",
+  "columns": [
+    {
+      "name": "event_id",
+      "type": "string",
+      "length": 24,
+      "prefix": "evt-"
+    },
+    {
+      "name": "device_name",
+      "type": "string",
+      "choices": ["sensor-alpha", "sensor-beta", "sensor-gamma", "sensor-delta"]
+    },
+    {
+      "name": "region",
+      "type": "string",
+      "choices": ["us-west", "us-east", "eu-central", "ap-south"]
+    },
+    {
+      "name": "temperature_c",
+      "type": "double",
+      "min": -20.0,
+      "max": 45.0,
+      "precision": 2
+    },
+    {
+      "name": "humidity_pct",
+      "type": "int",
+      "min": 0,
+      "max": 100
+    },
+    {
+      "name": "pressure_hpa",
+      "type": "float",
+      "min": 950.0,
+      "max": 1050.0,
+      "precision": 1
+    },
+    {
+      "name": "reading_count",
+      "type": "long",
+      "min": 0,
+      "max": 10000000000
+    },
+    {
+      "name": "is_active",
+      "type": "boolean",
+      "true_probability": 0.9
+    },
+    {
+      "name": "event_time",
+      "type": "timestamp",
+      "jitter_seconds": 0.5
+    },
+    {
+      "name": "event_date",
+      "type": "date",
+      "offset_days": 0,
+      "range_days": 1
+    },
+    {
+      "name": "payload",
+      "type": "binary",
+      "length": 16,
+      "nullable": true,
+      "null_probability": 0.1
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+# Last-entered values (may contain client_secret — do not commit)
+.zerobus_feeder_last.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.Python
+build/
+dist/
+
+# Local configs / secrets
+*.local.yaml
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store

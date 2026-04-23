@@ -698,6 +698,37 @@ def _handle_workspace_auth_failure(cfg: "Config", original: Exception):
         raise SystemExit(1)
 
 
+def _create_sp_oauth_secret(w, sp_id) -> str:
+    """Create an OAuth client secret for a workspace-level service principal.
+
+    The databricks-sdk WorkspaceClient does not (as of 0.105) expose a
+    service_principal_secrets namespace — that only exists on AccountClient
+    and requires account-admin. The workspace REST endpoint, however, is
+    reachable by workspace admins with Service-principal:Manager, so we call
+    it directly through the SDK's generic api_client.
+
+    Endpoint (workspace-addressed):
+        POST /api/2.0/accounts/servicePrincipals/{sp_id}/credentials/secrets
+    Response includes the plaintext `secret` (shown once).
+    """
+    path = f"/api/2.0/accounts/servicePrincipals/{sp_id}/credentials/secrets"
+    logger.info("POST %s", path)
+    try:
+        resp = w.api_client.do("POST", path)
+    except Exception as e:
+        logger.warning("OAuth secret REST call failed: %s", e)
+        say(f"[yellow]Secret creation call failed: {e}[/yellow]", level=logging.WARNING)
+        return ""
+    secret = (resp or {}).get("secret", "") if isinstance(resp, dict) else ""
+    if not secret:
+        logger.warning("secret missing in response: keys=%s",
+                       list((resp or {}).keys()) if isinstance(resp, dict) else type(resp))
+        return ""
+    logger.info("OAuth secret created (length=%d, expire_time=%s)",
+                len(secret), resp.get("expire_time"))
+    return secret
+
+
 def create_service_principal(cfg: Config) -> None:
     w = _workspace_client(cfg)
     say(f"[cyan]Creating service principal[/cyan] '{cfg.sp_display_name}'...")
@@ -711,15 +742,7 @@ def create_service_principal(cfg: Config) -> None:
     say(f"[green]✓[/green] service principal id={sp.id}  application_id={client_id}")
 
     say("[cyan]Generating OAuth client secret...[/cyan]")
-    client_secret = ""
-    try:
-        # databricks-sdk >=0.30 exposes this namespace on WorkspaceClient.
-        secret = w.service_principal_secrets.create(service_principal_id=int(sp.id))
-        client_secret = getattr(secret, "secret", "") or ""
-        logger.info("OAuth secret created (length=%d)", len(client_secret))
-    except Exception as e:
-        logger.warning("service_principal_secrets.create failed: %s", e)
-        say(f"[yellow]SDK secret creation failed: {e}[/yellow]", level=logging.WARNING)
+    client_secret = _create_sp_oauth_secret(w, sp.id)
 
     if not client_secret:
         say(

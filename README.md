@@ -223,8 +223,9 @@ helpers and to prefill `workspace_url` / `workspace_id`.
 | `sample_schema.json` | Example data-structure definition |
 | `sample_config.yaml` | Example YAML config |
 | `requirements.txt` | Python dependencies |
-| `.gitignore` | Excludes `.zerobus_feeder_last.yaml`, venvs, caches |
+| `.gitignore` | Excludes the last-values file, log file, venvs, caches |
 | `.zerobus_feeder_last.yaml` | Auto-generated, local-only, stores last-used values **including the client secret** — never commit this |
+| `zerobus_feeder.log` | Auto-generated, local-only, detailed per-session log (config resolution, SP/table creation, DDL, periodic latency snapshots, errors). Appended across runs. Never commit this |
 
 ## Troubleshooting
 

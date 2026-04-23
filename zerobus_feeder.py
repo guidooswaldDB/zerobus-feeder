@@ -13,13 +13,16 @@ import base64
 import configparser
 import getpass
 import json
+import logging
 import os
 import random
+import re
 import signal
 import string
 import sys
 import threading
 import time
+import traceback
 from collections import deque
 from dataclasses import asdict, dataclass, field, fields
 from datetime import date, datetime, timedelta, timezone
@@ -37,6 +40,7 @@ from rich.text import Text
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 LAST_VALUES_FILE = SCRIPT_DIR / ".zerobus_feeder_last.yaml"
+LOG_FILE = SCRIPT_DIR / "zerobus_feeder.log"
 DATABRICKS_CFG = Path.home() / ".databrickscfg"
 
 CLOUDS = ("aws", "azure", "gcp")
@@ -51,6 +55,65 @@ DELTA_TYPE_MAP = {
 }
 
 console = Console()
+logger = logging.getLogger("zerobus_feeder")
+
+
+# ---------------------------------------------------------------- Logging --
+
+def setup_logging() -> None:
+    """Attach a file handler that captures every step and output.
+
+    Runs once per process; subsequent calls are no-ops. The log file is
+    appended to across runs with a clear session banner.
+    """
+    if logger.handlers:
+        return
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    try:
+        handler = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
+    except Exception as e:
+        console.print(f"[yellow]Could not open log file {LOG_FILE}: {e}[/yellow]")
+        return
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter(
+        fmt="%(asctime)s.%(msecs)03d %(levelname)-7s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logger.addHandler(handler)
+    logger.info("=" * 72)
+    logger.info("Session started  pid=%d  cwd=%s  python=%s",
+                os.getpid(), os.getcwd(), sys.version.split()[0])
+    logger.info("argv=%s", " ".join(sys.argv))
+
+
+def _strip_markup(s: str) -> str:
+    """Convert a Rich-markup string to plain text for log output."""
+    try:
+        return Text.from_markup(str(s)).plain
+    except Exception:
+        return str(s)
+
+
+def say(message: str, level: int = logging.INFO) -> None:
+    """Print to the console (with Rich markup) and mirror to the log file."""
+    console.print(message)
+    logger.log(level, _strip_markup(message))
+
+
+def _mask(secret: str, show_last: int = 4) -> str:
+    if not secret:
+        return ""
+    if len(secret) <= show_last:
+        return "*" * len(secret)
+    return "*" * (len(secret) - show_last) + secret[-show_last:]
+
+
+def log_config(cfg: "Config", label: str) -> None:
+    safe = asdict(cfg)
+    if safe.get("client_secret"):
+        safe["client_secret"] = _mask(safe["client_secret"])
+    logger.info("%s: %s", label, safe)
 
 
 # ---------------------------------------------------------------- Config ----
@@ -183,7 +246,6 @@ def _read_profile_raw(profile: str) -> dict:
 
 def _workspace_id_from_host(host: str) -> Optional[str]:
     """Azure workspace URLs embed the workspace id: adb-<id>.<n>.azuredatabricks.net."""
-    import re
     m = re.search(r"adb-(\d+)\.", host or "")
     return m.group(1) if m else None
 
@@ -191,15 +253,17 @@ def _workspace_id_from_host(host: str) -> Optional[str]:
 def enrich_from_profile(cfg: Config) -> None:
     if not cfg.profile:
         return
+    logger.info("enriching from profile '%s'", cfg.profile)
     raw = _read_profile_raw(cfg.profile)
+    logger.info("profile raw keys: %s", sorted(raw.keys()))
     if not cfg.workspace_url and raw.get("host"):
         cfg.workspace_url = raw["host"].rstrip("/")
-        console.print(f"[dim]Prefilled workspace_url from profile: {cfg.workspace_url}[/dim]")
+        say(f"[dim]Prefilled workspace_url from profile: {cfg.workspace_url}[/dim]")
     if not cfg.workspace_id:
         wid = raw.get("workspace_id") or _workspace_id_from_host(raw.get("host", ""))
         if wid:
             cfg.workspace_id = str(wid)
-            console.print(f"[dim]Prefilled workspace_id from profile: {wid}[/dim]")
+            say(f"[dim]Prefilled workspace_id from profile: {wid}[/dim]")
     # If something is still missing, try the SDK as a best-effort fallback.
     # Stay quiet on auth failures — the user may just not be logged in yet.
     if cfg.workspace_url and cfg.workspace_id:
@@ -214,10 +278,10 @@ def enrich_from_profile(cfg: Config) -> None:
                 ma = w.metastores.current()
                 if ma and getattr(ma, "workspace_id", None):
                     cfg.workspace_id = str(ma.workspace_id)
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as e:
+                logger.debug("metastores.current() failed: %s", e)
+    except Exception as e:
+        logger.debug("SDK fallback enrichment failed: %s", e)
 
 
 # ----------------------------------------------------- Interactive wizard ----
@@ -235,8 +299,9 @@ def prompt_field(name: str, label: str, current: str, secret: bool) -> str:
 
 def profile_picker(cfg: Config) -> None:
     profiles = list_cli_profiles()
+    logger.info("available CLI profiles: %s", profiles)
     if not profiles:
-        console.print("[yellow]No ~/.databrickscfg profiles found.[/yellow]")
+        say("[yellow]No ~/.databrickscfg profiles found.[/yellow]", level=logging.WARNING)
         return
     console.print("\n[bold]Databricks CLI profiles[/bold]")
     for i, p in enumerate(profiles, 1):
@@ -250,6 +315,7 @@ def profile_picker(cfg: Config) -> None:
     except ValueError:
         idx = 0
     cfg.profile = profiles[idx - 1] if 1 <= idx <= len(profiles) else ""
+    logger.info("profile selected: '%s' (choice=%s)", cfg.profile, choice)
 
 
 def interactive_wizard(cfg: Config, only_missing: bool) -> Config:
@@ -510,67 +576,83 @@ def _workspace_client(cfg: Config):
     try:
         from databricks.sdk import WorkspaceClient
     except ImportError:
-        console.print("[red]databricks-sdk is required for --create-sp / --create-table.[/red]")
-        console.print("[red]Install: pip install databricks-sdk[/red]")
+        say("[red]databricks-sdk is required for --create-sp / --create-table.[/red]",
+            level=logging.ERROR)
+        say("[red]Install: pip install databricks-sdk[/red]", level=logging.ERROR)
         raise SystemExit(1)
     if not cfg.profile:
-        console.print("[red]A Databricks CLI profile is required for --create-sp / --create-table.[/red]")
+        say("[red]A Databricks CLI profile is required for --create-sp / --create-table.[/red]",
+            level=logging.ERROR)
         raise SystemExit(1)
+    logger.info("constructing WorkspaceClient(profile=%s)", cfg.profile)
     return WorkspaceClient(profile=cfg.profile)
 
 
 def create_service_principal(cfg: Config) -> None:
     w = _workspace_client(cfg)
-    console.print(f"[cyan]Creating service principal[/cyan] '{cfg.sp_display_name}'...")
-    sp = w.service_principals.create(display_name=cfg.sp_display_name)
+    say(f"[cyan]Creating service principal[/cyan] '{cfg.sp_display_name}'...")
+    try:
+        sp = w.service_principals.create(display_name=cfg.sp_display_name)
+    except Exception as e:
+        logger.exception("service_principals.create failed")
+        say(f"[red]Failed to create service principal: {e}[/red]", level=logging.ERROR)
+        raise SystemExit(1)
     client_id = sp.application_id or ""
-    console.print(f"[green]✓[/green] service principal id={sp.id}  application_id={client_id}")
+    say(f"[green]✓[/green] service principal id={sp.id}  application_id={client_id}")
 
-    console.print("[cyan]Generating OAuth client secret...[/cyan]")
+    say("[cyan]Generating OAuth client secret...[/cyan]")
     client_secret = ""
     try:
         # databricks-sdk >=0.30 exposes this namespace on WorkspaceClient.
         secret = w.service_principal_secrets.create(service_principal_id=int(sp.id))
         client_secret = getattr(secret, "secret", "") or ""
+        logger.info("OAuth secret created (length=%d)", len(client_secret))
     except Exception as e:
-        console.print(f"[yellow]SDK secret creation failed: {e}[/yellow]")
+        logger.warning("service_principal_secrets.create failed: %s", e)
+        say(f"[yellow]SDK secret creation failed: {e}[/yellow]", level=logging.WARNING)
 
     if not client_secret:
-        console.print(
+        say(
             f"[red]Could not create an OAuth secret automatically.[/red]\n"
             f"Create one manually in the Databricks UI:\n"
             f"  {w.config.host.rstrip('/')}/settings/workspace/identity-and-access/service-principals\n"
             f"  → open '{cfg.sp_display_name}' → Secrets → Generate secret\n"
-            f"Then re-run with --client-id / --client-secret (or enter them interactively)."
+            f"Then re-run with --client-id / --client-secret (or enter them interactively).",
+            level=logging.ERROR,
         )
         raise SystemExit(1)
 
     cfg.client_id = client_id
     cfg.client_secret = client_secret
-    console.print("[green]✓[/green] OAuth secret created and stored in the last-values file.")
+    say("[green]✓[/green] OAuth secret created and stored in the last-values file.")
     console.print(
         "[bold yellow]Copy the secret now; Databricks will not show it again.[/bold yellow]\n"
         f"  client_id:     {client_id}\n"
         f"  client_secret: {client_secret}"
     )
+    logger.info("SP credentials populated: client_id=%s client_secret=%s",
+                client_id, _mask(client_secret))
 
 
 def create_table(cfg: Config) -> None:
     w = _workspace_client(cfg)
     gen = DataGenerator(cfg.schema_file)  # validates schema early
+    logger.info("schema loaded from %s with %d columns", cfg.schema_file, len(gen.columns))
 
     warehouse_id = cfg.warehouse_id or _pick_warehouse(w)
     cfg.warehouse_id = warehouse_id
+    logger.info("using warehouse_id=%s", warehouse_id)
 
     cols = ",\n  ".join(
         f"{c['name']} {DELTA_TYPE_MAP[c['type'].lower()]}"
         for c in gen.columns
     )
     ddl = f"CREATE TABLE IF NOT EXISTS {cfg.table_name} (\n  {cols}\n)"
-    console.print("[cyan]Executing DDL:[/cyan]")
+    say("[cyan]Executing DDL:[/cyan]")
     console.print(Panel(ddl, border_style="dim"))
+    logger.info("DDL:\n%s", ddl)
     _execute_sql(w, warehouse_id, ddl)
-    console.print(f"[green]✓[/green] Table {cfg.table_name} ready.")
+    say(f"[green]✓[/green] Table {cfg.table_name} ready.")
 
     if cfg.client_id and Confirm.ask(
         f"Grant USE CATALOG / USE SCHEMA / MODIFY / SELECT to {cfg.client_id} on this table?",
@@ -579,7 +661,8 @@ def create_table(cfg: Config) -> None:
         try:
             catalog, schema, _ = cfg.table_name.split(".")
         except ValueError:
-            console.print(f"[red]table_name must be catalog.schema.table; got {cfg.table_name!r}[/red]")
+            say(f"[red]table_name must be catalog.schema.table; got {cfg.table_name!r}[/red]",
+                level=logging.ERROR)
             return
         for sql in (
             f"GRANT USE CATALOG ON CATALOG {catalog} TO `{cfg.client_id}`",
@@ -587,13 +670,14 @@ def create_table(cfg: Config) -> None:
             f"GRANT MODIFY, SELECT ON TABLE {cfg.table_name} TO `{cfg.client_id}`",
         ):
             _execute_sql(w, warehouse_id, sql)
-        console.print("[green]✓[/green] Grants applied.")
+        say("[green]✓[/green] Grants applied.")
 
 
 def _pick_warehouse(w) -> str:
     warehouses = list(w.warehouses.list())
+    logger.info("warehouses available: %d", len(warehouses))
     if not warehouses:
-        console.print("[red]No SQL warehouses found in this workspace.[/red]")
+        say("[red]No SQL warehouses found in this workspace.[/red]", level=logging.ERROR)
         raise SystemExit(1)
     console.print("\n[bold]SQL warehouses[/bold]")
     for i, wh in enumerate(warehouses, 1):
@@ -602,14 +686,17 @@ def _pick_warehouse(w) -> str:
     choice = Prompt.ask("Select warehouse number", default="1")
     try:
         idx = int(choice) - 1
-        return warehouses[idx].id
+        chosen = warehouses[idx]
+        logger.info("warehouse selected: name=%s id=%s", chosen.name, chosen.id)
+        return chosen.id
     except (ValueError, IndexError):
-        console.print("[red]Invalid selection.[/red]")
+        say("[red]Invalid selection.[/red]", level=logging.ERROR)
         raise SystemExit(1)
 
 
 def _execute_sql(w, warehouse_id: str, sql: str) -> None:
     from databricks.sdk.service.sql import StatementState
+    logger.info("SQL → warehouse=%s: %s", warehouse_id, sql)
     resp = w.statement_execution.execute_statement(
         warehouse_id=warehouse_id, statement=sql, wait_timeout="30s",
     )
@@ -619,8 +706,10 @@ def _execute_sql(w, warehouse_id: str, sql: str) -> None:
     state = resp.status.state if resp.status else None
     if state != StatementState.SUCCEEDED:
         err = (resp.status.error.message if resp.status and resp.status.error else "unknown")
-        console.print(f"[red]SQL failed ({state}): {err}[/red]\n[dim]{sql}[/dim]")
+        logger.error("SQL failed (%s): %s\n%s", state, err, sql)
+        say(f"[red]SQL failed ({state}): {err}[/red]\n[dim]{sql}[/dim]", level=logging.ERROR)
         raise SystemExit(1)
+    logger.info("SQL succeeded: %s", state)
 
 
 # --------------------------------------------------------------- Feeder ----
@@ -630,17 +719,19 @@ def run_feeder(cfg: Config) -> None:
         from zerobus.sdk.shared import RecordType, StreamConfigurationOptions, TableProperties
         from zerobus.sdk.sync import ZerobusSdk
     except ImportError:
-        console.print("[red]databricks-zerobus-ingest-sdk is required.[/red]")
-        console.print("[red]Install: pip install databricks-zerobus-ingest-sdk[/red]")
+        say("[red]databricks-zerobus-ingest-sdk is required.[/red]", level=logging.ERROR)
+        say("[red]Install: pip install databricks-zerobus-ingest-sdk[/red]", level=logging.ERROR)
         sys.exit(1)
 
     generator = DataGenerator(cfg.schema_file)
     endpoint = cfg.zerobus_endpoint()
+    logger.info("feeder starting  endpoint=%s  workspace_url=%s  table=%s  target_qps=%.3f  columns=%d",
+                endpoint, cfg.workspace_url, cfg.table_name, cfg.qps, len(generator.columns))
 
-    console.print(f"[cyan]Connecting[/cyan] endpoint={endpoint}")
-    console.print(f"[cyan]Workspace URL[/cyan] {cfg.workspace_url}")
-    console.print(f"[cyan]Table[/cyan] {cfg.table_name}")
-    console.print(f"[cyan]Authenticating[/cyan] as client_id={cfg.client_id}")
+    say(f"[cyan]Connecting[/cyan] endpoint={endpoint}")
+    say(f"[cyan]Workspace URL[/cyan] {cfg.workspace_url}")
+    say(f"[cyan]Table[/cyan] {cfg.table_name}")
+    say(f"[cyan]Authenticating[/cyan] as client_id={cfg.client_id}")
 
     sdk = ZerobusSdk(endpoint, cfg.workspace_url)
     options = StreamConfigurationOptions(record_type=RecordType.JSON)
@@ -649,20 +740,26 @@ def run_feeder(cfg: Config) -> None:
     try:
         stream = sdk.create_stream(cfg.client_id, cfg.client_secret, table_props, options)
     except Exception as e:
-        console.print(f"[red]Failed to open Zerobus stream: {e}[/red]")
+        logger.exception("create_stream failed")
+        say(f"[red]Failed to open Zerobus stream: {e}[/red]", level=logging.ERROR)
         sys.exit(1)
-    console.print("[green]✓[/green] Stream opened. Starting ingestion...")
+    say("[green]✓[/green] Stream opened. Starting ingestion...")
 
     stats = Stats()
     stop = threading.Event()
+    stop_reason = {"value": "normal exit"}
 
     def _sigint(signum, frame):
+        stop_reason["value"] = f"signal {signum}"
+        logger.info("received signal %s — stopping feeder", signum)
         stop.set()
     signal.signal(signal.SIGINT, _sigint)
 
     target_qps = max(0.001, float(cfg.qps))
     interval = 1.0 / target_qps
     next_send = time.perf_counter()
+    last_stats_log = time.time()
+    last_logged_error = ""
 
     try:
         with Live(render_dashboard(stats.snapshot(), cfg, target_qps),
@@ -680,7 +777,12 @@ def run_feeder(cfg: Config) -> None:
                     stream.ingest_record(payload)
                     stats.record_ok((time.perf_counter() - t0) * 1000.0)
                 except Exception as e:
-                    stats.record_error(str(e)[:200])
+                    msg = str(e)[:200]
+                    stats.record_error(msg)
+                    # Log only when the error message changes to avoid flooding.
+                    if msg != last_logged_error:
+                        logger.warning("ingest error: %s", msg)
+                        last_logged_error = msg
 
                 next_send += interval
                 # If we fell far behind, don't spiral.
@@ -688,22 +790,45 @@ def run_feeder(cfg: Config) -> None:
                 if drift > 5.0:
                     next_send = time.perf_counter()
 
+                # Periodic stats dump to the log file.
+                if time.time() - last_stats_log >= 5.0:
+                    snap = stats.snapshot()
+                    logger.info(
+                        "stats sent=%d errors=%d elapsed=%.1fs actual_qps=%.2f "
+                        "latency cur=%.2fms p50=%.2f p95=%.2f p99=%.2f min=%.2f max=%.2f",
+                        snap["sent"], snap["errors"], snap["elapsed"], snap["qps_actual"],
+                        snap["cur"], snap["p50"], snap["p95"], snap["p99"],
+                        snap["min"], snap["max"],
+                    )
+                    last_stats_log = time.time()
+
                 live.update(render_dashboard(stats.snapshot(), cfg, target_qps))
+    except Exception as e:
+        stop_reason["value"] = f"exception: {e}"
+        logger.exception("feeder loop crashed")
+        raise
     finally:
-        console.print("\n[cyan]Flushing and closing stream...[/cyan]")
+        say("\n[cyan]Flushing and closing stream...[/cyan]")
         try:
             stream.flush()
+            logger.info("stream flushed")
         except Exception as e:
-            console.print(f"[yellow]flush: {e}[/yellow]")
+            logger.warning("flush failed: %s", e)
+            say(f"[yellow]flush: {e}[/yellow]", level=logging.WARNING)
         try:
             stream.close()
+            logger.info("stream closed")
         except Exception as e:
-            console.print(f"[yellow]close: {e}[/yellow]")
+            logger.warning("close failed: %s", e)
+            say(f"[yellow]close: {e}[/yellow]", level=logging.WARNING)
         snap = stats.snapshot()
-        console.print(
-            f"[bold]Done.[/bold] sent={snap['sent']:,}  errors={snap['errors']:,}  "
-            f"elapsed={format_duration(snap['elapsed'])}  actual_qps={snap['qps_actual']:.1f}"
+        summary = (
+            f"Done. sent={snap['sent']:,}  errors={snap['errors']:,}  "
+            f"elapsed={format_duration(snap['elapsed'])}  actual_qps={snap['qps_actual']:.1f}  "
+            f"reason={stop_reason['value']}"
         )
+        console.print(f"[bold]{summary}[/bold]")
+        logger.info("feeder stopped: %s", summary)
 
 
 # ------------------------------------------------------------- Argparse ----
@@ -759,23 +884,30 @@ def first_run() -> bool:
 # ---------------------------------------------------------------- main ----
 
 def main() -> None:
+    setup_logging()
     args = build_parser().parse_args()
+    logger.info("parsed args: %s", vars(args))
 
     cfg = Config()
 
     if args.config:
-        console.print(f"[cyan]Loading YAML config:[/cyan] {args.config}")
+        say(f"[cyan]Loading YAML config:[/cyan] {args.config}")
         for k, v in load_yaml_config(args.config).items():
             setattr(cfg, k, v)
+        log_config(cfg, "config after YAML load")
     else:
         last = load_last_values()
+        if last:
+            logger.info("loaded last-values file with %d keys", len(last))
         for k, v in last.items():
             if hasattr(cfg, k) and v is not None:
                 setattr(cfg, k, v)
         apply_args(cfg, args)
+        log_config(cfg, "config after last-values + CLI args")
 
     # Detect first run and offer guided setup (only if not using YAML/non-interactive).
     if first_run() and not args.config and not args.non_interactive:
+        logger.info("first-run guided setup triggered (no last-values file)")
         console.print(Panel.fit(
             "[bold]Welcome to Zerobus Feeder[/bold]\n"
             "It looks like this is your first run. I'll walk you through:\n"
@@ -791,14 +923,18 @@ def main() -> None:
                 enrich_from_profile(cfg)
         if not args.create_sp and Confirm.ask("Create a new service principal now?", default=False):
             args.create_sp = True
+            logger.info("user opted into --create-sp at first-run prompt")
         if not args.create_table and Confirm.ask("Create the target table now?", default=False):
             args.create_table = True
+            logger.info("user opted into --create-table at first-run prompt")
 
     interactive = args.interactive or (
         not args.config and not args.non_interactive and bool(missing_required(cfg))
     )
     if interactive:
+        logger.info("entering interactive wizard (forced=%s)", args.interactive)
         interactive_wizard(cfg, only_missing=not args.interactive)
+        log_config(cfg, "config after interactive wizard")
 
     # Secondary enrichment if profile got set but fields still missing.
     if cfg.profile and (not cfg.workspace_url or not cfg.workspace_id):
@@ -808,22 +944,23 @@ def main() -> None:
     if args.create_sp:
         create_service_principal(cfg)
         save_last_values(cfg)
+        log_config(cfg, "config after --create-sp")
 
     if args.create_table:
         if not cfg.schema_file:
-            console.print("[red]--create-table requires --schema-file.[/red]")
+            say("[red]--create-table requires --schema-file.[/red]", level=logging.ERROR)
             sys.exit(2)
         if not cfg.table_name:
-            console.print("[red]--create-table requires --table-name.[/red]")
+            say("[red]--create-table requires --table-name.[/red]", level=logging.ERROR)
             sys.exit(2)
         create_table(cfg)
         save_last_values(cfg)
 
     missing = missing_required(cfg)
     if missing:
-        console.print("[red]Missing or invalid required parameters:[/red]")
+        say("[red]Missing or invalid required parameters:[/red]", level=logging.ERROR)
         for m in missing:
-            console.print(f"  • {m}")
+            say(f"  • {m}", level=logging.ERROR)
         console.print(
             "\nProvide them via CLI flags, a YAML config (--config), or run interactively "
             "(omit --non-interactive)."
@@ -839,8 +976,19 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         console.print("\n[yellow]Aborted by user.[/yellow]")
+        logger.info("aborted by user (KeyboardInterrupt)")
         sys.exit(130)
     except EOFError:
         # Ctrl+D at an interactive prompt.
         console.print("\n[yellow]Input closed; aborting.[/yellow]")
+        logger.info("aborted (EOF on stdin)")
         sys.exit(130)
+    except SystemExit as e:
+        logger.info("exit code=%s", e.code)
+        raise
+    except Exception:
+        logger.exception("unhandled exception")
+        console.print_exception()
+        sys.exit(1)
+    else:
+        logger.info("session ended cleanly")

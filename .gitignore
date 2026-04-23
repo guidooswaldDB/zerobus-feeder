@@ -1,6 +1,10 @@
 # Last-entered values (may contain client_secret — do not commit)
 .zerobus_feeder_last.yaml
 
+# Runtime log file (may contain workspace URLs, table names, endpoint info)
+zerobus_feeder.log
+zerobus_feeder.log.*
+
 # Python
 __pycache__/
 *.py[cod]

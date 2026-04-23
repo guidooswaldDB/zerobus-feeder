@@ -33,11 +33,36 @@ Features:
 
 ## Installation
 
+### Option A: startup scripts (recommended)
+
+The `run.sh` (Linux / macOS) and `run.bat` (Windows) wrappers create a local
+virtualenv on first launch, install dependencies, and then forward all
+arguments to `zerobus_feeder.py`:
+
+```bash
+# Linux / macOS
+git clone https://github.com/guidooswaldDB/zerobus-feeder.git
+cd zerobus-feeder
+./run.sh
+```
+
+```bat
+REM Windows
+git clone https://github.com/guidooswaldDB/zerobus-feeder.git
+cd zerobus-feeder
+run.bat
+```
+
+Subsequent runs reuse the existing venv and skip reinstalling unless
+`requirements.txt` has changed.
+
+### Option B: manual
+
 ```bash
 git clone https://github.com/guidooswaldDB/zerobus-feeder.git
 cd zerobus-feeder
 python3 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate           # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
@@ -47,7 +72,7 @@ On the first invocation there is no remembered state, so the script offers a
 guided setup:
 
 ```bash
-python zerobus_feeder.py
+./run.sh                # or: run.bat   — or: python zerobus_feeder.py
 ```
 
 The wizard will:
@@ -193,6 +218,8 @@ helpers and to prefill `workspace_url` / `workspace_id`.
 | File | Purpose |
 |---|---|
 | `zerobus_feeder.py` | The script |
+| `run.sh` | Startup wrapper for Linux / macOS (creates venv, installs deps, runs the script) |
+| `run.bat` | Startup wrapper for Windows (same behaviour as `run.sh`) |
 | `sample_schema.json` | Example data-structure definition |
 | `sample_config.yaml` | Example YAML config |
 | `requirements.txt` | Python dependencies |

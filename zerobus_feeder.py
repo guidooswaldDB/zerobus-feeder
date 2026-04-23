@@ -121,7 +121,7 @@ def log_config(cfg: "Config", label: str) -> None:
 
 @dataclass
 class Config:
-    qps: float = 10.0
+    eps: float = 10.0
     schema_file: str = ""
     workspace_id: str = ""
     region: str = ""
@@ -147,7 +147,7 @@ class Config:
 
 # (field, label, is_secret, is_required)
 PARAMS: list[tuple[str, str, bool, bool]] = [
-    ("qps",           "Transmission rate (QPS)",               False, True),
+    ("eps",           "Transmission rate (EPS — events / sec)", False, True),
     ("schema_file",   "Data structure JSON path",              False, True),
     ("workspace_id",  "Workspace ID (digits)",                 False, True),
     ("region",        "Region (e.g. us-west-2, eastus)",       False, True),
@@ -412,11 +412,11 @@ def interactive_wizard(cfg: Config, only_missing: bool) -> Config:
         if only_missing and (current or not required):
             continue
         new_val = prompt_field(name, label, str(current) if current else "", secret)
-        if name == "qps":
+        if name == "eps":
             try:
                 setattr(cfg, name, float(new_val))
             except ValueError:
-                console.print(f"[red]Invalid QPS; keeping {cfg.qps}[/red]")
+                console.print(f"[red]Invalid EPS; keeping {cfg.eps}[/red]")
         else:
             setattr(cfg, name, new_val)
 
@@ -431,7 +431,7 @@ def missing_required(cfg: Config) -> list[str]:
         if not required:
             continue
         val = getattr(cfg, name)
-        if val is None or val == "" or (name == "qps" and not val):
+        if val is None or val == "" or (name == "eps" and not val):
             missing.append(label)
     if cfg.cloud and cfg.cloud.lower() not in CLOUDS:
         missing.append(f"cloud must be one of {CLOUDS} (got {cfg.cloud!r})")
@@ -594,7 +594,7 @@ class Stats:
                 "sent": self.sent,
                 "errors": self.errors,
                 "elapsed": elapsed,
-                "qps_actual": self.sent / elapsed,
+                "eps_actual": self.sent / elapsed,
                 "last_error": self.last_error,
                 "cur": self.last_latency,
                 "last_avg": last_avg,
@@ -701,7 +701,7 @@ def format_duration(seconds: float) -> str:
     return f"{h:d}:{m:02d}:{s:02d}"
 
 
-def render_dashboard(snap: dict, cfg: Config, target_qps: float) -> Panel:
+def render_dashboard(snap: dict, cfg: Config, target_eps: float) -> Panel:
     stats = Table.grid(padding=(0, 2), expand=True)
     stats.add_column(style="bold")
     stats.add_column()
@@ -714,7 +714,7 @@ def render_dashboard(snap: dict, cfg: Config, target_qps: float) -> Panel:
     )
     stats.add_row(
         "Elapsed:", format_duration(snap["elapsed"]),
-        "QPS (target/actual):", f"{target_qps:.1f} / {snap['qps_actual']:.1f}",
+        "EPS (target/actual):", f"{target_eps:.1f} / {snap['eps_actual']:.1f}",
     )
     stats.add_row(
         "Latency now:", f"{snap['cur']:.2f} ms",
@@ -1182,8 +1182,8 @@ def run_feeder(cfg: Config) -> None:
 
     generator = DataGenerator(cfg.schema_file)
     endpoint = cfg.zerobus_endpoint()
-    logger.info("feeder starting  endpoint=%s  workspace_url=%s  table=%s  target_qps=%.3f  columns=%d",
-                endpoint, cfg.workspace_url, cfg.table_name, cfg.qps, len(generator.columns))
+    logger.info("feeder starting  endpoint=%s  workspace_url=%s  table=%s  target_eps=%.3f  columns=%d",
+                endpoint, cfg.workspace_url, cfg.table_name, cfg.eps, len(generator.columns))
 
     say(f"[cyan]Connecting[/cyan] endpoint={endpoint}")
     say(f"[cyan]Workspace URL[/cyan] {cfg.workspace_url}")
@@ -1228,14 +1228,14 @@ def run_feeder(cfg: Config) -> None:
         stop.set()
     signal.signal(signal.SIGINT, _sigint)
 
-    target_qps = max(0.001, float(cfg.qps))
-    interval = 1.0 / target_qps
+    target_eps = max(0.001, float(cfg.eps))
+    interval = 1.0 / target_eps
     next_send = time.perf_counter()
     last_stats_log = time.time()
     last_logged_error = ""
 
     try:
-        with Live(render_dashboard(stats.snapshot(), cfg, target_qps),
+        with Live(render_dashboard(stats.snapshot(), cfg, target_eps),
                   console=console, refresh_per_second=5, screen=False) as live:
             while not stop.is_set():
                 now = time.perf_counter()
@@ -1267,15 +1267,15 @@ def run_feeder(cfg: Config) -> None:
                 if time.time() - last_stats_log >= 5.0:
                     snap = stats.snapshot()
                     logger.info(
-                        "stats sent=%d errors=%d elapsed=%.1fs actual_qps=%.2f "
+                        "stats sent=%d errors=%d elapsed=%.1fs actual_eps=%.2f "
                         "latency cur=%.2fms p50=%.2f p95=%.2f p99=%.2f min=%.2f max=%.2f",
-                        snap["sent"], snap["errors"], snap["elapsed"], snap["qps_actual"],
+                        snap["sent"], snap["errors"], snap["elapsed"], snap["eps_actual"],
                         snap["cur"], snap["p50"], snap["p95"], snap["p99"],
                         snap["min"], snap["max"],
                     )
                     last_stats_log = time.time()
 
-                live.update(render_dashboard(stats.snapshot(), cfg, target_qps))
+                live.update(render_dashboard(stats.snapshot(), cfg, target_eps))
     except Exception as e:
         stop_reason["value"] = f"exception: {e}"
         logger.exception("feeder loop crashed")
@@ -1297,7 +1297,7 @@ def run_feeder(cfg: Config) -> None:
         snap = stats.snapshot()
         summary = (
             f"Done. sent={snap['sent']:,}  errors={snap['errors']:,}  "
-            f"elapsed={format_duration(snap['elapsed'])}  actual_qps={snap['qps_actual']:.1f}  "
+            f"elapsed={format_duration(snap['elapsed'])}  actual_eps={snap['eps_actual']:.1f}  "
             f"reason={stop_reason['value']}"
         )
         console.print(f"[bold]{summary}[/bold]")
@@ -1312,7 +1312,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Send a configurable synthetic data stream to a Databricks Zerobus endpoint.",
     )
     p.add_argument("--config", "-c", help="Path to YAML config file (overrides all other parameters)")
-    p.add_argument("--qps", type=float, help="Transmission rate in queries (records) per second")
+    p.add_argument("--eps", type=float, help="Transmission rate in events (records) per second")
     p.add_argument("--schema-file", help="Path to JSON file describing the data structure")
     p.add_argument("--workspace-id", help="Workspace ID (digits) used to build the Zerobus endpoint")
     p.add_argument("--region", help="Region code (e.g. us-west-2, eastus)")
@@ -1338,7 +1338,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def apply_args(cfg: Config, args: argparse.Namespace) -> None:
     mapping = {
-        "qps": "qps", "schema_file": "schema_file", "workspace_id": "workspace_id",
+        "eps": "eps", "schema_file": "schema_file", "workspace_id": "workspace_id",
         "region": "region", "cloud": "cloud", "table_name": "table_name",
         "client_id": "client_id", "client_secret": "client_secret",
         "workspace_url": "workspace_url", "profile": "profile",

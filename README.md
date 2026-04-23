@@ -101,7 +101,7 @@ listed in `.gitignore`) and prefilled next time.
 python zerobus_feeder.py [options]
 
   --config, -c FILE         Path to YAML config file (overrides all other params)
-  --qps FLOAT               Target records per second
+  --eps FLOAT               Target events (records) per second
   --schema-file FILE        JSON file describing the data structure
   --workspace-id DIGITS     Used to build the Zerobus endpoint
   --region CODE             e.g. us-west-2, eastus
@@ -119,7 +119,7 @@ python zerobus_feeder.py [options]
   --non-interactive         Never prompt; error on any missing required parameter
 ```
 
-Mandatory parameters: `qps`, `schema_file`, `workspace_id`, `region`, `cloud`,
+Mandatory parameters: `eps`, `schema_file`, `workspace_id`, `region`, `cloud`,
 `table_name`, `client_id`, `client_secret`, `workspace_url`. In
 `--non-interactive` mode the script exits with code 2 and lists any missing
 ones.
@@ -161,7 +161,7 @@ python zerobus_feeder.py \
   --schema-file sample_schema.json \
   --table-name main.default.zerobus_feeder_events \
   --cloud aws --region us-west-2 --workspace-id 1234567890123456 \
-  --create-sp --create-table --qps 50
+  --create-sp --create-table --eps 50
 ```
 
 This will:
@@ -172,7 +172,7 @@ This will:
 2. Prompt for (or auto-pick) a SQL warehouse, issue
    `CREATE TABLE IF NOT EXISTS <table>`, then grant
    `USE CATALOG` / `USE SCHEMA` / `MODIFY` / `SELECT` to the SP.
-3. Start the stream at 50 QPS with the live dashboard.
+3. Start the stream at 50 EPS with the live dashboard.
 
 If the workspace-level OAuth secret API isn't available, the script prints a
 link to the Databricks UI so you can generate the secret manually, then rerun
@@ -197,7 +197,7 @@ python zerobus_feeder.py --config /path/to/config.yaml
 
 While running, the terminal shows:
 
-- Target vs. actual QPS, total sent, errors, elapsed time
+- Target vs. actual EPS (events per second), total sent, errors, elapsed time
 - Current / min / max / p50 / p95 / p99 latency (ms)
 - Unicode-block sparkline of recent per-record latencies
 - Target table, Zerobus endpoint, workspace URL
@@ -235,7 +235,7 @@ helpers and to prefill `workspace_url` / `workspace_id`.
 - **`Connection refused` / DNS errors**: verify `cloud` and `region` match the
   workspace; the endpoint is built as
   `<workspace_id>.zerobus.<region>.<cloud-suffix>`.
-- **Actual QPS well below target**: latency dominates at the single-stream
+- **Actual EPS well below target**: latency dominates at the single-stream
   throughput limit (100 MB/s, 15 k rows/s). Run multiple instances or lower the
   per-record payload.
 - **First-run wizard doesn't appear**: it triggers only when

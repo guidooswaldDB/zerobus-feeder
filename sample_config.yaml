@@ -2,8 +2,8 @@
 # When passed via --config, all other CLI parameters are ignored.
 # Any missing field will cause the script to exit with an error in non-interactive mode.
 
-# Transmission rate in records per second.
-qps: 50
+# Transmission rate in events (records) per second.
+eps: 50
 
 # Path to the JSON file describing the data structure (see sample_schema.json).
 schema_file: sample_schema.json

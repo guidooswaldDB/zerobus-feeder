@@ -732,10 +732,13 @@ def render_dashboard(snap: dict, cfg: Config, target_qps: float) -> Panel:
     )
 
     hist = snap["history"]
-    label_w = 11  # "  1234.5 ms"
-    # Use the whole terminal width minus the label column and panel chrome.
+    label_w = 11   # "  1234.5 ms"
+    side_pad = 1   # one blank column each side of the graph
+    # Panel chrome = 2 border chars + 2 default horizontal padding chars.
+    # Row layout: [label][ ][side_pad][graph][side_pad]
+    panel_chrome = 4
     term_w = console.size.width or 120
-    graph_width = max(20, term_w - label_w - 4)  # 2 border chars each side
+    graph_width = max(20, term_w - label_w - 1 - 2 * side_pad - panel_chrome)
     graph_height = 12
 
     rows, y_min, y_max = latency_graph(
@@ -749,6 +752,9 @@ def render_dashboard(snap: dict, cfg: Config, target_qps: float) -> Panel:
             return f"{v:8.1f} ms"
         return f"{v:8.2f} ms"
 
+    left_gutter = " " * (side_pad + 1)   # separator + blank-column padding
+    right_gutter = " " * side_pad
+
     labeled_rows: list[Text] = []
     if rows:
         mid_idx = len(rows) // 2
@@ -759,21 +765,24 @@ def render_dashboard(snap: dict, cfg: Config, target_qps: float) -> Panel:
                 label = fmt_y(y_min)
             elif i == mid_idx:
                 # Geometric midpoint on a log scale.
-                mid_val = (10 ** ((math.log10(max(y_min, 0.01)) + math.log10(max(y_max, 0.01))) / 2))
+                mid_val = 10 ** ((math.log10(max(y_min, 0.01)) + math.log10(max(y_max, 0.01))) / 2)
                 label = fmt_y(mid_val)
             else:
                 label = " " * label_w
-            labeled_rows.append(Text(label + " ", style="dim") + row)
+            labeled_rows.append(
+                Text(label + left_gutter, style="dim") + row + Text(right_gutter)
+            )
     else:
         labeled_rows.append(Text("(no samples yet)", style="dim"))
 
-    # Footer rule + legend + axis caption.
-    rule = Text(" " * label_w + " " + "─" * graph_width, style="dim")
+    # Footer rule + legend aligned to the same gutter as the graph rows.
+    gutter_prefix = " " * label_w + left_gutter
+    rule = Text(gutter_prefix + "─" * graph_width + right_gutter, style="dim")
     legend = Text.assemble(
-        (" " * label_w + " ", "dim"),
+        (gutter_prefix, "dim"),
         ("█ avg  ", AVG_STYLE),
         ("█ max  ", MAX_STYLE),
-        (f"log scale, 1 column = 1 s, newest →   ", "dim"),
+        ("log scale, 1 column = 1 s, newest →   ", "dim"),
         (f"buckets: {len(hist)}", "dim"),
     )
     graph_block = Group(*labeled_rows, rule, legend)

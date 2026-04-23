@@ -136,12 +136,19 @@ def load_yaml_config(path: str) -> dict:
 def list_cli_profiles() -> list[str]:
     if not DATABRICKS_CFG.exists():
         return []
+    # default_section=None would be cleanest but is only honoured on write.
+    # configparser always strips [DEFAULT] from sections(); re-add it when it
+    # looks like a real profile (has a host) so the user sees every profile.
     cp = configparser.ConfigParser()
     try:
         cp.read(DATABRICKS_CFG)
     except Exception:
         return []
-    return cp.sections()
+    profiles: list[str] = []
+    if cp.defaults().get("host"):
+        profiles.append("DEFAULT")
+    profiles.extend(cp.sections())
+    return profiles
 
 
 def enrich_from_profile(cfg: Config) -> None:

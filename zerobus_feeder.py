@@ -828,19 +828,78 @@ def create_table(cfg: Config) -> None:
         f"Grant USE CATALOG / USE SCHEMA / MODIFY / SELECT to {cfg.client_id} on this table?",
         default=True,
     ):
-        try:
-            catalog, schema, _ = cfg.table_name.split(".")
-        except ValueError:
-            say(f"[red]table_name must be catalog.schema.table; got {cfg.table_name!r}[/red]",
-                level=logging.ERROR)
-            return
-        for sql in (
-            f"GRANT USE CATALOG ON CATALOG {catalog} TO `{cfg.client_id}`",
-            f"GRANT USE SCHEMA ON SCHEMA {catalog}.{schema} TO `{cfg.client_id}`",
-            f"GRANT MODIFY, SELECT ON TABLE {cfg.table_name} TO `{cfg.client_id}`",
-        ):
-            _execute_sql(w, warehouse_id, sql)
-        say("[green]✓[/green] Grants applied.")
+        _apply_zerobus_grants(w, warehouse_id, cfg.table_name, cfg.client_id)
+
+
+def _split_table_name(table_name: str) -> tuple[str, str, str]:
+    parts = table_name.split(".")
+    if len(parts) != 3:
+        raise ValueError(f"table_name must be catalog.schema.table; got {table_name!r}")
+    return parts[0], parts[1], parts[2]
+
+
+def _apply_zerobus_grants(w, warehouse_id: str, table_name: str, principal: str) -> None:
+    """Grant the catalog/schema/table permissions Zerobus requires for a
+    service principal. Zerobus rejects schema-level inheritance, so the
+    table-level GRANT MODIFY, SELECT must be explicit.
+    """
+    catalog, schema, _ = _split_table_name(table_name)
+    sqls = (
+        f"GRANT USE CATALOG ON CATALOG {catalog} TO `{principal}`",
+        f"GRANT USE SCHEMA ON SCHEMA {catalog}.{schema} TO `{principal}`",
+        f"GRANT MODIFY, SELECT ON TABLE {table_name} TO `{principal}`",
+    )
+    for sql in sqls:
+        _execute_sql(w, warehouse_id, sql)
+    say("[green]✓[/green] Grants applied.")
+
+
+def _fixup_missing_grants(cfg: "Config") -> bool:
+    """Interactively apply the grants Zerobus needs. Returns True if the
+    grants were applied and the caller should retry the stream.
+    """
+    if not cfg.table_name or not cfg.client_id:
+        return False
+    try:
+        catalog, schema, _ = _split_table_name(cfg.table_name)
+    except ValueError as e:
+        say(f"[red]{e}[/red]", level=logging.ERROR)
+        return False
+
+    say(
+        "\n[yellow]Zerobus rejected the service principal's authorizations.[/yellow]\n"
+        "The SP is missing explicit table-level grants. Required SQL:"
+    )
+    grants_sql = (
+        f"GRANT USE CATALOG ON CATALOG {catalog} TO `{cfg.client_id}`;\n"
+        f"GRANT USE SCHEMA ON SCHEMA {catalog}.{schema} TO `{cfg.client_id}`;\n"
+        f"GRANT MODIFY, SELECT ON TABLE {cfg.table_name} TO `{cfg.client_id}`;"
+    )
+    console.print(Panel(grants_sql, border_style="dim"))
+
+    if not cfg.profile:
+        say(
+            "[yellow]Set --profile (a Databricks CLI profile with admin rights) so I can apply these for you,\n"
+            "or run the statements above in a SQL editor / notebook, then rerun.[/yellow]",
+            level=logging.WARNING,
+        )
+        return False
+
+    if not Confirm.ask("Apply these grants now using your CLI profile?", default=True):
+        return False
+
+    try:
+        w = _workspace_client(cfg)
+        warehouse_id = cfg.warehouse_id or _pick_warehouse(w)
+        cfg.warehouse_id = warehouse_id
+        _apply_zerobus_grants(w, warehouse_id, cfg.table_name, cfg.client_id)
+    except SystemExit:
+        raise
+    except Exception as e:
+        logger.exception("_fixup_missing_grants failed")
+        say(f"[red]Could not apply grants: {e}[/red]", level=logging.ERROR)
+        return False
+    return True
 
 
 def _pick_warehouse(w) -> str:
@@ -910,9 +969,25 @@ def run_feeder(cfg: Config) -> None:
     try:
         stream = sdk.create_stream(cfg.client_id, cfg.client_secret, table_props, options)
     except Exception as e:
-        logger.exception("create_stream failed")
-        say(f"[red]Failed to open Zerobus stream: {e}[/red]", level=logging.ERROR)
-        sys.exit(1)
+        msg = str(e)
+        auth_err = (
+            "invalid_authorization_details" in msg
+            or "User is not authorized" in msg
+            or "401" in msg
+        )
+        if auth_err and _fixup_missing_grants(cfg):
+            say("[cyan]Retrying stream open after applying grants...[/cyan]")
+            time.sleep(2)  # brief pause for grant propagation
+            try:
+                stream = sdk.create_stream(cfg.client_id, cfg.client_secret, table_props, options)
+            except Exception as e2:
+                logger.exception("create_stream failed after grants")
+                say(f"[red]Still failed after applying grants: {e2}[/red]", level=logging.ERROR)
+                sys.exit(1)
+        else:
+            logger.exception("create_stream failed")
+            say(f"[red]Failed to open Zerobus stream: {e}[/red]", level=logging.ERROR)
+            sys.exit(1)
     say("[green]✓[/green] Stream opened. Starting ingestion...")
 
     stats = Stats()

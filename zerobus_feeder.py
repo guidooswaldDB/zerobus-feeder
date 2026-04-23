@@ -813,6 +813,8 @@ def create_table(cfg: Config) -> None:
     cfg.warehouse_id = warehouse_id
     logger.info("using warehouse_id=%s", warehouse_id)
 
+    _ensure_catalog_and_schema(w, warehouse_id, cfg.table_name)
+
     cols = ",\n  ".join(
         f"{c['name']} {DELTA_TYPE_MAP[c['type'].lower()]}"
         for c in gen.columns
@@ -836,6 +838,73 @@ def _split_table_name(table_name: str) -> tuple[str, str, str]:
     if len(parts) != 3:
         raise ValueError(f"table_name must be catalog.schema.table; got {table_name!r}")
     return parts[0], parts[1], parts[2]
+
+
+def _catalog_exists(w, name: str) -> Optional[bool]:
+    """Return True if the catalog exists, False if it doesn't, None if the
+    existence check itself failed (permission denied etc.)."""
+    try:
+        from databricks.sdk.errors import NotFound
+    except Exception:
+        NotFound = ()  # type: ignore
+    try:
+        w.catalogs.get(name)
+        return True
+    except NotFound:  # type: ignore[misc]
+        return False
+    except Exception as e:
+        logger.debug("catalogs.get(%s) failed: %s", name, e)
+        return None
+
+
+def _schema_exists(w, catalog: str, schema: str) -> Optional[bool]:
+    try:
+        from databricks.sdk.errors import NotFound
+    except Exception:
+        NotFound = ()  # type: ignore
+    try:
+        w.schemas.get(f"{catalog}.{schema}")
+        return True
+    except NotFound:  # type: ignore[misc]
+        return False
+    except Exception as e:
+        logger.debug("schemas.get(%s.%s) failed: %s", catalog, schema, e)
+        return None
+
+
+def _ensure_catalog_and_schema(w, warehouse_id: str, table_name: str) -> None:
+    """Ensure the catalog and schema from `table_name` exist; offer to create
+    them when they don't. Runs before the CREATE TABLE DDL so the DDL itself
+    doesn't fail on a missing parent object."""
+    catalog, schema, _ = _split_table_name(table_name)
+
+    cat_state = _catalog_exists(w, catalog)
+    if cat_state is True:
+        logger.info("catalog %s exists", catalog)
+    elif cat_state is False:
+        say(f"[yellow]Catalog '{catalog}' does not exist.[/yellow]", level=logging.WARNING)
+        if not Confirm.ask(f"Create catalog '{catalog}' now?", default=True):
+            say(f"[red]Cannot continue without catalog {catalog}.[/red]", level=logging.ERROR)
+            raise SystemExit(1)
+        _execute_sql(w, warehouse_id, f"CREATE CATALOG IF NOT EXISTS {catalog}")
+        say(f"[green]✓[/green] Catalog {catalog} created.")
+    else:
+        logger.info("catalog existence check for %s inconclusive; assuming present", catalog)
+
+    sch_state = _schema_exists(w, catalog, schema)
+    if sch_state is True:
+        logger.info("schema %s.%s exists", catalog, schema)
+    elif sch_state is False:
+        say(f"[yellow]Schema '{catalog}.{schema}' does not exist.[/yellow]", level=logging.WARNING)
+        if not Confirm.ask(f"Create schema '{catalog}.{schema}' now?", default=True):
+            say(f"[red]Cannot continue without schema {catalog}.{schema}.[/red]",
+                level=logging.ERROR)
+            raise SystemExit(1)
+        _execute_sql(w, warehouse_id, f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
+        say(f"[green]✓[/green] Schema {catalog}.{schema} created.")
+    else:
+        logger.info("schema existence check for %s.%s inconclusive; assuming present",
+                    catalog, schema)
 
 
 def _apply_zerobus_grants(w, warehouse_id: str, table_name: str, principal: str) -> None:

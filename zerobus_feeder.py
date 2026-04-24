@@ -516,48 +516,55 @@ class DataGenerator:
 # ----------------------------------------------------------- Stats / UI ----
 
 class Stats:
-    """Per-record stats plus per-second aggregation buckets (avg + max)."""
+    """Latency from periodic serial probes; EPS from non-blocking sends."""
 
-    def __init__(self, history_secs: int = 600):
-        self.sent = 0
+    def __init__(self, history_batches: int = 600):
+        self.sent = 0              # non-blocking sends only (for EPS)
+        self.bytes_sent = 0        # non-blocking payload bytes
         self.errors = 0
         self.started = time.time()
-        self.window = deque(maxlen=2000)  # for percentiles
+        self.window = deque(maxlen=2000)  # probe latencies for percentiles
         self.last_latency = 0.0
         self.last_error: str = ""
+        self.phase: str = "probing"
         self._lock = threading.Lock()
 
-        # Per-second rolling history of (avg_ms, max_ms).
-        self.bucket_start = int(self.started)
-        self.cur_count = 0
-        self.cur_sum = 0.0
-        self.cur_max = 0.0
-        self.hist = deque(maxlen=history_secs)
+        # Streaming-phase wall time (seconds) — basis for EPS.
+        self.stream_elapsed = 0.0
+        self._phase_since = time.perf_counter()
 
-    def _roll(self, now: float) -> None:
-        """Flush finished 1-second buckets into hist."""
-        now_sec = int(now)
-        while self.bucket_start < now_sec:
-            if self.cur_count > 0:
-                avg = self.cur_sum / self.cur_count
-                self.hist.append((avg, self.cur_max))
-            else:
-                self.hist.append((0.0, 0.0))
-            self.bucket_start += 1
-            self.cur_count = 0
-            self.cur_sum = 0.0
-            self.cur_max = 0.0
+        # One (avg_ms, max_ms) entry per probe batch.
+        self.hist: deque[tuple[float, float]] = deque(maxlen=history_batches)
 
-    def record_ok(self, latency_ms: float) -> None:
+    def set_phase(self, phase: str) -> None:
         with self._lock:
-            self._roll(time.time())
+            now = time.perf_counter()
+            if self.phase == "streaming":
+                self.stream_elapsed += now - self._phase_since
+            self.phase = phase
+            self._phase_since = now
+
+    def _stream_elapsed_now(self) -> float:
+        """Total streaming-phase wall time including any in-progress window."""
+        if self.phase == "streaming":
+            return self.stream_elapsed + (time.perf_counter() - self._phase_since)
+        return self.stream_elapsed
+
+    def record_probe_batch(self, latencies_ms: list[float]) -> None:
+        """Record a batch of serial probe latencies (blocks on server ACK)."""
+        if not latencies_ms:
+            return
+        with self._lock:
+            self.window.extend(latencies_ms)
+            self.last_latency = latencies_ms[-1]
+            avg = sum(latencies_ms) / len(latencies_ms)
+            self.hist.append((avg, max(latencies_ms)))
+
+    def record_sent(self, payload_bytes: int = 0) -> None:
+        """Count a non-blocking send (used for EPS and bytes)."""
+        with self._lock:
             self.sent += 1
-            self.window.append(latency_ms)
-            self.last_latency = latency_ms
-            self.cur_count += 1
-            self.cur_sum += latency_ms
-            if latency_ms > self.cur_max:
-                self.cur_max = latency_ms
+            self.bytes_sent += payload_bytes
 
     def record_error(self, message: str) -> None:
         with self._lock:
@@ -567,13 +574,8 @@ class Stats:
     def snapshot(self) -> dict:
         with self._lock:
             now = time.time()
-            self._roll(now)
             elapsed = max(1e-9, now - self.started)
-            # Include the in-flight partial bucket so the rightmost bar
-            # grows in place instead of only appearing at the 1s tick.
-            hist = list(self.hist)
-            if self.cur_count > 0:
-                hist.append((self.cur_sum / self.cur_count, self.cur_max))
+            stream_elapsed = self._stream_elapsed_now()
             window = sorted(self.window)
             n = len(window)
 
@@ -582,19 +584,18 @@ class Stats:
                     return 0.0
                 return window[min(n - 1, int(n * p))]
 
-            # Last full bucket's avg/max (fallback to in-flight if no full one yet).
             if self.hist:
                 last_avg, last_max = self.hist[-1]
-            elif self.cur_count > 0:
-                last_avg, last_max = self.cur_sum / self.cur_count, self.cur_max
             else:
                 last_avg = last_max = 0.0
 
             return {
                 "sent": self.sent,
+                "bytes_sent": self.bytes_sent,
                 "errors": self.errors,
                 "elapsed": elapsed,
-                "eps_actual": self.sent / elapsed,
+                "stream_elapsed": stream_elapsed,
+                "eps_actual": self.sent / stream_elapsed if stream_elapsed > 0 else 0.0,
                 "last_error": self.last_error,
                 "cur": self.last_latency,
                 "last_avg": last_avg,
@@ -604,7 +605,8 @@ class Stats:
                 "p50": pct(0.50),
                 "p95": pct(0.95),
                 "p99": pct(0.99),
-                "history": hist,  # list[(avg_ms, max_ms)], one per second
+                "history": list(self.hist),  # one entry per probe batch
+                "phase": self.phase,
             }
 
 
@@ -694,6 +696,15 @@ def latency_graph(
     return rows, y_min, y_max
 
 
+def format_bytes(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{int(size)} B" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
 def format_duration(seconds: float) -> str:
     seconds = int(seconds)
     h, rem = divmod(seconds, 3600)
@@ -708,8 +719,16 @@ def render_dashboard(snap: dict, cfg: Config, target_eps: float) -> Panel:
     stats.add_column(style="bold")
     stats.add_column()
 
+    phase_label, phase_color = {
+        "probing": ("● measuring latency (10 serial probes)", "yellow"),
+        "streaming": ("● pushing max messages (non-blocking)", "green"),
+    }.get(snap.get("phase", ""), (f"● {snap.get('phase', 'starting')}", "dim"))
     stats.add_row(
-        "Sent:", f"{snap['sent']:,}",
+        "Status:", f"[{phase_color}]{phase_label}[/{phase_color}]",
+        "", "",
+    )
+    stats.add_row(
+        "Sent:", f"{snap['sent']:,}  ({format_bytes(snap['bytes_sent'])})",
         "Errors:", f"[{'red' if snap['errors'] else 'dim'}]{snap['errors']:,}[/]",
     )
     stats.add_row(
@@ -723,7 +742,7 @@ def render_dashboard(snap: dict, cfg: Config, target_eps: float) -> Panel:
     )
     stats.add_row(
         "Latency min / max:", f"{snap['min']:.2f} / {snap['max']:.2f} ms",
-        "Last-sec avg / max:",
+        "Last probe avg / max:",
         f"{snap['last_avg']:.2f} / {snap['last_max']:.2f} ms",
     )
     stats.add_row(
@@ -782,8 +801,8 @@ def render_dashboard(snap: dict, cfg: Config, target_eps: float) -> Panel:
         (gutter_prefix, "dim"),
         ("█ avg  ", AVG_STYLE),
         ("█ max  ", MAX_STYLE),
-        ("log scale, 1 column = 1 s, newest →   ", "dim"),
-        (f"buckets: {len(hist)}", "dim"),
+        ("log scale, 1 column = 1 probe batch, newest →   ", "dim"),
+        (f"probes: {len(hist)}", "dim"),
     )
     graph_block = Group(*labeled_rows, rule, legend)
 
@@ -1172,6 +1191,9 @@ def _execute_sql(w, warehouse_id: str, sql: str) -> None:
 # --------------------------------------------------------------- Feeder ----
 
 def run_feeder(cfg: Config) -> None:
+    # Silence the Rust SDK's tracing_subscriber so it doesn't scribble on
+    # stderr inside the Rich Live dashboard. Must be set before SDK import.
+    os.environ.setdefault("RUST_LOG", "error")
     try:
         from zerobus.sdk.shared import RecordType, StreamConfigurationOptions, TableProperties
         from zerobus.sdk.sync import ZerobusSdk
@@ -1234,25 +1256,65 @@ def run_feeder(cfg: Config) -> None:
     last_stats_log = time.time()
     last_logged_error = ""
 
+    probe_count = 10
+    probe_every_secs = 10.0
+    next_probe_at = time.perf_counter()  # probe immediately on start
+    last_ui_update = 0.0
+    ui_refresh_secs = 0.2
+
     try:
         with Live(render_dashboard(stats.snapshot(), cfg, target_eps),
                   console=console, refresh_per_second=5, screen=False) as live:
             while not stop.is_set():
                 now = time.perf_counter()
+
+                # Keep the dashboard ticking even when idle between sends.
+                if now - last_ui_update >= ui_refresh_secs:
+                    live.update(render_dashboard(stats.snapshot(), cfg, target_eps))
+                    last_ui_update = now
+
+                # --- Probe phase: 10 serial sends, block on ACK, record latency.
+                if now >= next_probe_at:
+                    stats.set_phase("probing")
+                    live.update(render_dashboard(stats.snapshot(), cfg, target_eps))
+                    last_ui_update = time.perf_counter()
+                    latencies: list[float] = []
+                    for _ in range(probe_count):
+                        if stop.is_set():
+                            break
+                        record = generator.generate()
+                        payload = json.dumps(record)
+                        t0 = time.perf_counter()
+                        try:
+                            offset = stream.ingest_record_offset(payload)
+                            stream.wait_for_offset(offset)
+                            latencies.append((time.perf_counter() - t0) * 1000.0)
+                        except Exception as e:
+                            msg = str(e)[:200]
+                            stats.record_error(msg)
+                            if msg != last_logged_error:
+                                logger.warning("probe ingest error: %s", msg)
+                                last_logged_error = msg
+                    stats.record_probe_batch(latencies)
+                    next_probe_at = time.perf_counter() + probe_every_secs
+                    next_send = time.perf_counter()
+                    stats.set_phase("streaming")
+                    continue
+
+                # --- Stream phase: non-blocking sends at target EPS.
                 if now < next_send:
-                    time.sleep(min(0.2, next_send - now))
+                    wake = min(next_send, next_probe_at)
+                    time.sleep(min(0.2, max(0.0, wake - now)))
                     continue
 
                 record = generator.generate()
                 payload = json.dumps(record)
-                t0 = time.perf_counter()
                 try:
-                    stream.ingest_record(payload)
-                    stats.record_ok((time.perf_counter() - t0) * 1000.0)
+                    stream.ingest_record_nowait(payload)
+                    stats.record_sent(len(payload.encode("utf-8")))
                 except Exception as e:
                     msg = str(e)[:200]
                     stats.record_error(msg)
-                    # Log only when the error message changes to avoid flooding.
                     if msg != last_logged_error:
                         logger.warning("ingest error: %s", msg)
                         last_logged_error = msg
@@ -1267,15 +1329,15 @@ def run_feeder(cfg: Config) -> None:
                 if time.time() - last_stats_log >= 5.0:
                     snap = stats.snapshot()
                     logger.info(
-                        "stats sent=%d errors=%d elapsed=%.1fs actual_eps=%.2f "
-                        "latency cur=%.2fms p50=%.2f p95=%.2f p99=%.2f min=%.2f max=%.2f",
-                        snap["sent"], snap["errors"], snap["elapsed"], snap["eps_actual"],
+                        "stats sent=%d bytes=%d errors=%d elapsed=%.1fs stream=%.1fs "
+                        "actual_eps=%.2f latency cur=%.2fms p50=%.2f p95=%.2f p99=%.2f "
+                        "min=%.2f max=%.2f",
+                        snap["sent"], snap["bytes_sent"], snap["errors"],
+                        snap["elapsed"], snap["stream_elapsed"], snap["eps_actual"],
                         snap["cur"], snap["p50"], snap["p95"], snap["p99"],
                         snap["min"], snap["max"],
                     )
                     last_stats_log = time.time()
-
-                live.update(render_dashboard(stats.snapshot(), cfg, target_eps))
     except Exception as e:
         stop_reason["value"] = f"exception: {e}"
         logger.exception("feeder loop crashed")
@@ -1296,9 +1358,10 @@ def run_feeder(cfg: Config) -> None:
             say(f"[yellow]close: {e}[/yellow]", level=logging.WARNING)
         snap = stats.snapshot()
         summary = (
-            f"Done. sent={snap['sent']:,}  errors={snap['errors']:,}  "
-            f"elapsed={format_duration(snap['elapsed'])}  actual_eps={snap['eps_actual']:.1f}  "
-            f"reason={stop_reason['value']}"
+            f"Done. sent={snap['sent']:,} ({format_bytes(snap['bytes_sent'])})  "
+            f"errors={snap['errors']:,}  elapsed={format_duration(snap['elapsed'])}  "
+            f"stream={format_duration(snap['stream_elapsed'])}  "
+            f"actual_eps={snap['eps_actual']:.1f}  reason={stop_reason['value']}"
         )
         console.print(f"[bold]{summary}[/bold]")
         logger.info("feeder stopped: %s", summary)

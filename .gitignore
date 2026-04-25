@@ -26,3 +26,6 @@ dist/
 .idea/
 *.swp
 .DS_Store
+
+# Generated config (contains client_secret) — do not commit
+feeder_config.yaml

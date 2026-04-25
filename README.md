@@ -117,6 +117,7 @@ python zerobus_feeder.py [options]
   --sp-display-name NAME    Display name for --create-sp
   --create-sp               Create an SP + OAuth secret (needs --profile)
   --create-table            Create the target table from the schema (needs --profile)
+  --no-table-latency        Skip the periodic ingest-latency SQL query
   --interactive             Force prompts for every parameter
   --non-interactive         Never prompt; error on any missing required parameter
 ```
@@ -200,14 +201,39 @@ python zerobus_feeder.py --config /path/to/config.yaml
 While running, the terminal shows:
 
 - Target vs. actual EPS (events per second), total sent, errors, elapsed time
-- Current / min / max / p50 / p95 / p99 latency (ms)
+- Current / min / max / p50 / p95 / p99 SDK round-trip latency (ms)
 - Unicode-block sparkline of recent per-record latencies
+- End-to-end ingest latency (event_time → file_modification_time) over the
+  last 15 minutes, sampled via a SQL query against the target table after
+  every probe batch — disable with `--no-table-latency`
 - Target table, Zerobus endpoint, workspace URL
 
 ![Live dashboard screenshot](docs/images/dashboard-screenshot.png)
 
 Press `Ctrl+C` to flush and close the stream cleanly; a final summary is
 printed.
+
+### Ingest-latency query
+
+When a `profile` and `warehouse_id` are configured (or `warehouse_id` is
+selected at startup when missing), the feeder executes this query once per
+probe cycle on the same SQL warehouse:
+
+```sql
+SELECT
+  count(*)                                                                              AS total_rows,
+  round(avg(unix_timestamp(_metadata.file_modification_time) - unix_timestamp(event_time)), 2) AS avg_latency_sec,
+  min(unix_timestamp(_metadata.file_modification_time)   - unix_timestamp(event_time))  AS min_latency_sec,
+  max(unix_timestamp(_metadata.file_modification_time)   - unix_timestamp(event_time))  AS max_latency_sec,
+  percentile_approx(unix_timestamp(_metadata.file_modification_time) - unix_timestamp(event_time), 0.5)  AS p50_latency_sec,
+  percentile_approx(unix_timestamp(_metadata.file_modification_time) - unix_timestamp(event_time), 0.95) AS p95_latency_sec,
+  percentile_approx(unix_timestamp(_metadata.file_modification_time) - unix_timestamp(event_time), 0.99) AS p99_latency_sec
+FROM <catalog>.<schema>.<table>
+WHERE event_time >= current_timestamp() - INTERVAL 15 MINUTES;
+```
+
+The query is bounded by a 15s warehouse-side timeout, so a cold warehouse
+cannot stall streaming. Pass `--no-table-latency` to skip it entirely.
 
 ## Authentication
 

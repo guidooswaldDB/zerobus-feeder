@@ -133,6 +133,7 @@ class Config:
     workspace_url: str = ""
     warehouse_id: str = ""
     sp_display_name: str = "zerobus-feeder"
+    disable_table_latency: bool = False
 
     def zerobus_endpoint(self) -> str:
         cloud = (self.cloud or "").lower()
@@ -536,6 +537,9 @@ class Stats:
         # One (avg_ms, max_ms) entry per probe batch.
         self.hist: deque[tuple[float, float]] = deque(maxlen=history_batches)
 
+        # Last successful table-latency query result (or None).
+        self.table_latency: Optional[dict] = None
+
     def set_phase(self, phase: str) -> None:
         with self._lock:
             now = time.perf_counter()
@@ -570,6 +574,11 @@ class Stats:
         with self._lock:
             self.errors += 1
             self.last_error = message
+
+    def record_table_latency(self, result: Optional[dict]) -> None:
+        with self._lock:
+            if result is not None:
+                self.table_latency = result
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -607,6 +616,7 @@ class Stats:
                 "p99": pct(0.99),
                 "history": list(self.hist),  # one entry per probe batch
                 "phase": self.phase,
+                "table_latency": dict(self.table_latency) if self.table_latency else None,
             }
 
 
@@ -719,36 +729,75 @@ def render_dashboard(snap: dict, cfg: Config, target_eps: float) -> Panel:
     stats.add_column(style="bold")
     stats.add_column()
 
-    phase_label, phase_color = {
-        "probing": ("● measuring latency (10 serial probes)", "yellow"),
-        "streaming": ("● pushing max messages (non-blocking)", "green"),
-    }.get(snap.get("phase", ""), (f"● {snap.get('phase', 'starting')}", "dim"))
+    VAL_STYLE = "bold bright_cyan"
+    def hi(s: Any) -> str:
+        return f"[{VAL_STYLE}]{s}[/]"
+
+    phases = {
+        "probing":   ("● measuring latency (10 serial probes)", "yellow"),
+        "querying":  ("● querying ingest latency (SQL)",        "cyan"),
+        "streaming": ("● pushing max messages (non-blocking)",  "green"),
+    }
+    raw_label, phase_color = phases.get(
+        snap.get("phase", ""),
+        (f"● {snap.get('phase', 'starting')}", "dim"),
+    )
+    # Pad to the longest known label so column widths don't jitter when the
+    # phase changes (probing → querying → streaming).
+    phase_w = max(len(v[0]) for v in phases.values())
+    phase_label = raw_label.ljust(phase_w)
     stats.add_row(
         "Status:", f"[{phase_color}]{phase_label}[/{phase_color}]",
         "", "",
     )
+    err_color = "red" if snap['errors'] else "dim"
+    sent_n = f"{snap['sent']:,}"
+    bytes_n = format_bytes(snap['bytes_sent'])
+    eps_t = f"{target_eps:.1f}"
+    eps_a = f"{snap['eps_actual']:.1f}"
+    cur = f"{snap['cur']:.2f}"
+    p50 = f"{snap['p50']:.2f}"
+    p95 = f"{snap['p95']:.2f}"
+    p99 = f"{snap['p99']:.2f}"
+    lmin = f"{snap['min']:.2f}"
+    lmax = f"{snap['max']:.2f}"
+    lavg = f"{snap['last_avg']:.2f}"
+    lmaxp = f"{snap['last_max']:.2f}"
     stats.add_row(
-        "Sent:", f"{snap['sent']:,}  ({format_bytes(snap['bytes_sent'])})",
-        "Errors:", f"[{'red' if snap['errors'] else 'dim'}]{snap['errors']:,}[/]",
+        "Sent:", f"{hi(sent_n)}  ({hi(bytes_n)})",
+        "Errors:", f"[{err_color}]{snap['errors']:,}[/]",
     )
     stats.add_row(
-        "Elapsed:", format_duration(snap["elapsed"]),
-        "EPS (target/actual):", f"{target_eps:.1f} / {snap['eps_actual']:.1f}",
+        "Elapsed:", hi(format_duration(snap["elapsed"])),
+        "EPS (target/actual):", f"{hi(eps_t)} / {hi(eps_a)}",
     )
     stats.add_row(
-        "Latency now:", f"{snap['cur']:.2f} ms",
-        "p50 / p95 / p99:",
-        f"{snap['p50']:.2f} / {snap['p95']:.2f} / {snap['p99']:.2f} ms",
+        "Latency now:", f"{hi(cur)} ms",
+        "p50 / p95 / p99:", f"{hi(p50)} / {hi(p95)} / {hi(p99)} ms",
     )
     stats.add_row(
-        "Latency min / max:", f"{snap['min']:.2f} / {snap['max']:.2f} ms",
-        "Last probe avg / max:",
-        f"{snap['last_avg']:.2f} / {snap['last_max']:.2f} ms",
+        "Latency min / max:", f"{hi(lmin)} / {hi(lmax)} ms",
+        "Last probe avg / max:", f"{hi(lavg)} / {hi(lmaxp)} ms",
     )
     stats.add_row(
         "Target:", f"{cfg.table_name}",
         "Endpoint:", cfg.zerobus_endpoint() if cfg.workspace_id else "(unset)",
     )
+    tl = snap.get("table_latency")
+    if tl:
+        avg = tl.get("avg_latency_sec")
+        avg_s = f"{avg:.2f}" if isinstance(avg, (int, float)) else "—"
+        def n(key: str) -> str:
+            v = tl.get(key)
+            return hi(v) if v is not None else "—"
+        stats.add_row(
+            "Table latency (15m):",
+            f"avg {hi(avg_s)}s  p50 {n('p50_latency_sec')}s  "
+            f"p95 {n('p95_latency_sec')}s  p99 {n('p99_latency_sec')}s",
+            "Rows / range:",
+            f"{n('total_rows')}  "
+            f"({n('min_latency_sec')}s … {n('max_latency_sec')}s)",
+        )
 
     hist = snap["history"]
     label_w = 11   # "  1234.5 ms"
@@ -1188,6 +1237,69 @@ def _execute_sql(w, warehouse_id: str, sql: str) -> None:
     logger.info("SQL succeeded: %s", state)
 
 
+_TABLE_LATENCY_SQL = """
+SELECT
+  count(*)                                                                                       AS total_rows,
+  min(event_time)                                                                                AS earliest_event,
+  max(event_time)                                                                                AS latest_event,
+  round(avg(unix_timestamp(_metadata.file_modification_time) - unix_timestamp(event_time)), 2)   AS avg_latency_sec,
+  min(unix_timestamp(_metadata.file_modification_time)   - unix_timestamp(event_time))           AS min_latency_sec,
+  max(unix_timestamp(_metadata.file_modification_time)   - unix_timestamp(event_time))           AS max_latency_sec,
+  percentile_approx(unix_timestamp(_metadata.file_modification_time) - unix_timestamp(event_time), 0.5)  AS p50_latency_sec,
+  percentile_approx(unix_timestamp(_metadata.file_modification_time) - unix_timestamp(event_time), 0.95) AS p95_latency_sec,
+  percentile_approx(unix_timestamp(_metadata.file_modification_time) - unix_timestamp(event_time), 0.99) AS p99_latency_sec
+FROM {table}
+WHERE event_time >= current_timestamp() - INTERVAL 15 MINUTES
+""".strip()
+
+
+def _query_table_latency(w, warehouse_id: str, table_name: str) -> Optional[dict]:
+    """Run the ingest-latency query against the target table.
+
+    Returns a dict of named values, or None if the query failed/timed out.
+    Bounded by a 15s warehouse-side timeout so we never block streaming.
+    """
+    from databricks.sdk.service.sql import (
+        ExecuteStatementRequestOnWaitTimeout, StatementState,
+    )
+    sql = _TABLE_LATENCY_SQL.format(table=table_name)
+    try:
+        resp = w.statement_execution.execute_statement(
+            warehouse_id=warehouse_id,
+            statement=sql,
+            wait_timeout="15s",
+            on_wait_timeout=ExecuteStatementRequestOnWaitTimeout.CANCEL,
+        )
+        state = resp.status.state if resp.status else None
+        if state != StatementState.SUCCEEDED:
+            err = (resp.status.error.message
+                   if resp.status and resp.status.error else state)
+            logger.warning("table-latency query did not succeed: %s", err)
+            return None
+        cols = [c.name for c in resp.manifest.schema.columns]
+        row = resp.result.data_array[0] if resp.result and resp.result.data_array else None
+        if not row:
+            return None
+        out: dict[str, Any] = dict(zip(cols, row))
+        # Numeric fields come back as strings via the JSON-array result format.
+        for k in ("total_rows", "min_latency_sec", "max_latency_sec",
+                  "p50_latency_sec", "p95_latency_sec", "p99_latency_sec"):
+            if out.get(k) is not None:
+                try:
+                    out[k] = int(float(out[k]))
+                except (TypeError, ValueError):
+                    pass
+        if out.get("avg_latency_sec") is not None:
+            try:
+                out["avg_latency_sec"] = float(out["avg_latency_sec"])
+            except (TypeError, ValueError):
+                pass
+        return out
+    except Exception as e:
+        logger.warning("table-latency query failed: %s", e)
+        return None
+
+
 # --------------------------------------------------------------- Feeder ----
 
 def run_feeder(cfg: Config) -> None:
@@ -1239,6 +1351,30 @@ def run_feeder(cfg: Config) -> None:
             say(f"[red]Failed to open Zerobus stream: {e}[/red]", level=logging.ERROR)
             sys.exit(1)
     say("[green]✓[/green] Stream opened. Starting ingestion...")
+
+    # Optional: SQL Statement client for the periodic table-latency query.
+    # Runs after each probe batch, before resuming non-blocking sends.
+    tl_client = None
+    if cfg.disable_table_latency:
+        say("[dim]Table-latency query disabled (--no-table-latency).[/dim]")
+    else:
+        if cfg.profile:
+            try:
+                from databricks.sdk import WorkspaceClient
+                tl_client = WorkspaceClient(profile=cfg.profile)
+            except Exception as e:
+                logger.warning("table-latency: WorkspaceClient unavailable (%s)", e)
+        if tl_client is not None and not cfg.warehouse_id and sys.stdin.isatty():
+            say("[cyan]No SQL warehouse stored — pick one for the ingest-latency query "
+                "(or Ctrl+C to skip).[/cyan]")
+            try:
+                cfg.warehouse_id = _pick_warehouse(tl_client)
+                save_last_values(cfg)
+            except (SystemExit, KeyboardInterrupt):
+                cfg.warehouse_id = ""
+        if tl_client is None or not cfg.warehouse_id:
+            say("[dim]Table-latency query disabled (no warehouse configured).[/dim]")
+            tl_client = None
 
     stats = Stats()
     stop = threading.Event()
@@ -1296,6 +1432,30 @@ def run_feeder(cfg: Config) -> None:
                                 logger.warning("probe ingest error: %s", msg)
                                 last_logged_error = msg
                     stats.record_probe_batch(latencies)
+
+                    # Run the ingest-latency query before switching back to
+                    # non-blocking sends, so timing is taken at a quiet moment.
+                    if tl_client is not None:
+                        stats.set_phase("querying")
+                        live.update(render_dashboard(stats.snapshot(), cfg, target_eps))
+                        last_ui_update = time.perf_counter()
+                        tl_result = _query_table_latency(
+                            tl_client, cfg.warehouse_id, cfg.table_name,
+                        )
+                        if tl_result:
+                            stats.record_table_latency(tl_result)
+                            logger.info(
+                                "table-latency rows=%s avg=%ss min=%ss max=%ss "
+                                "p50=%ss p95=%ss p99=%ss",
+                                tl_result.get("total_rows"),
+                                tl_result.get("avg_latency_sec"),
+                                tl_result.get("min_latency_sec"),
+                                tl_result.get("max_latency_sec"),
+                                tl_result.get("p50_latency_sec"),
+                                tl_result.get("p95_latency_sec"),
+                                tl_result.get("p99_latency_sec"),
+                            )
+
                     next_probe_at = time.perf_counter() + probe_every_secs
                     next_send = time.perf_counter()
                     stats.set_phase("streaming")
@@ -1391,6 +1551,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Create a service principal (requires --profile) and store its credentials")
     p.add_argument("--create-table", action="store_true",
                    help="Create the target table from the schema file (requires --profile)")
+    p.add_argument("--no-table-latency", action="store_true",
+                   help="Disable the periodic ingest-latency SQL query "
+                        "(skips the SQL warehouse round-trip after each probe)")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--interactive", action="store_true",
                       help="Force interactive prompts for all parameters")
@@ -1411,6 +1574,8 @@ def apply_args(cfg: Config, args: argparse.Namespace) -> None:
         val = getattr(args, arg_key, None)
         if val is not None:
             setattr(cfg, cfg_key, val)
+    if getattr(args, "no_table_latency", False):
+        cfg.disable_table_latency = True
 
 
 def first_run() -> bool:

@@ -4,6 +4,8 @@ Configurable Python client that streams synthetic data into a Databricks
 [Zerobus](https://docs.databricks.com/aws/en/ingestion/zerobus-overview) endpoint.
 Useful for load-testing, demos, and smoke-testing Zerobus integrations.
 
+![Zerobus ingest overview](docs/images/zerobus-ingest-overview.png)
+
 Features:
 
 - CLI flags, YAML config file, or interactive wizard (your last entries are
@@ -201,6 +203,8 @@ While running, the terminal shows:
 - Current / min / max / p50 / p95 / p99 latency (ms)
 - Unicode-block sparkline of recent per-record latencies
 - Target table, Zerobus endpoint, workspace URL
+
+![Live dashboard screenshot](docs/images/dashboard-screenshot.png)
 
 Press `Ctrl+C` to flush and close the stream cleanly; a final summary is
 printed.

@@ -539,6 +539,8 @@ class Stats:
 
         # Last successful table-latency query result (or None).
         self.table_latency: Optional[dict] = None
+        # One (avg_sec, p50_sec, p95_sec, p99_sec) entry per successful query.
+        self.table_hist: deque[tuple[float, float, float, float]] = deque(maxlen=history_batches)
 
     def set_phase(self, phase: str) -> None:
         with self._lock:
@@ -575,10 +577,23 @@ class Stats:
             self.errors += 1
             self.last_error = message
 
-    def record_table_latency(self, result: Optional[dict]) -> None:
+    def record_table_latency_summary(self, result: Optional[dict]) -> None:
+        """Latest 15-minute query result, displayed in the summary row."""
         with self._lock:
             if result is not None:
                 self.table_latency = result
+
+    def record_table_latency_graph(self, result: Optional[dict]) -> None:
+        """Append a 30-second window result to the per-batch graph history."""
+        with self._lock:
+            if result is None:
+                return
+            vals = [result.get(k) for k in (
+                "avg_latency_sec", "p50_latency_sec",
+                "p95_latency_sec", "p99_latency_sec",
+            )]
+            if all(isinstance(v, (int, float)) for v in vals):
+                self.table_hist.append(tuple(float(v) for v in vals))  # type: ignore[arg-type]
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -617,6 +632,7 @@ class Stats:
                 "history": list(self.hist),  # one entry per probe batch
                 "phase": self.phase,
                 "table_latency": dict(self.table_latency) if self.table_latency else None,
+                "table_history": list(self.table_hist),  # one entry per table-latency query
             }
 
 
@@ -625,6 +641,13 @@ _LEVELS_PER_ROW = len(_BAR_BLOCKS) - 1  # 8
 
 AVG_STYLE = "bright_green"
 MAX_STYLE = "bright_yellow"
+
+# Table-latency band colours, ordered narrowest → widest band.
+# Each cell of the bar is coloured by the smallest percentile whose level
+# still covers it: avg ≤ p50 ≤ p95 ≤ p99 (with avg sometimes above p50).
+P50_STYLE = "bright_cyan"
+P95_STYLE = "bright_yellow"
+P99_STYLE = "bright_red"
 
 
 def latency_graph(
@@ -704,6 +727,74 @@ def latency_graph(
     y_min = (10 ** t_lo) if use_log else t_lo
     y_max = (10 ** t_hi) if use_log else t_hi
     return rows, y_min, y_max
+
+
+def multi_band_graph(
+    buckets: list[tuple[float, float, float, float]],
+    width: int,
+    height: int = 10,
+) -> tuple[list[Text], float, float]:
+    """Render a per-batch graph with four overlaid percentile bands.
+
+    Each tuple is (avg, p50, p95, p99). The bar height per column is the
+    largest of the four; each cell is coloured by the *smallest* band
+    whose level still contains it (so a cell is "avg-green" if it sits
+    below avg, otherwise "p50-cyan" if below p50, etc.).
+
+    Always linear, y-axis pinned to 0 so absolute magnitudes are obvious.
+    """
+    width = max(10, int(width))
+    if not buckets:
+        return [], 0.0, 0.0
+
+    if len(buckets) > width:
+        data = list(buckets)[-width:]
+    else:
+        data = list(buckets)
+    leading_pad = width - len(data)
+
+    tip_vals = [max(tup) for tup in data]
+    t_hi = max(tip_vals) if tip_vals else 0.0
+    if t_hi <= 0:
+        return [Text(" " * width, style="dim") for _ in range(height)], 0.0, 0.0
+    total_levels = height * _LEVELS_PER_ROW
+
+    def level_of(v: float) -> int:
+        if v <= 0:
+            return 0
+        return max(0, min(total_levels, int(round(v / t_hi * total_levels))))
+
+    # Per-column levels for each band, plus the bar tip (max of the four).
+    cols = [
+        tuple(level_of(v) for v in tup) + (level_of(max(tup)),)
+        for tup in data
+    ]
+    band_styles = (AVG_STYLE, P50_STYLE, P95_STYLE, P99_STYLE)
+
+    rows: list[Text] = []
+    for r in range(height, 0, -1):
+        lower = (r - 1) * _LEVELS_PER_ROW
+        upper = r * _LEVELS_PER_ROW
+        mid = lower + _LEVELS_PER_ROW / 2
+        row = Text()
+        if leading_pad > 0:
+            row.append(" " * leading_pad)
+        for avg_l, p50_l, p95_l, p99_l, tip in cols:
+            if tip >= upper:
+                ch = _BAR_BLOCKS[_LEVELS_PER_ROW]
+            elif tip <= lower:
+                ch = _BAR_BLOCKS[0]
+            else:
+                ch = _BAR_BLOCKS[tip - lower]
+            # Pick the smallest band whose level still covers `mid`.
+            covers = [(lvl, st) for lvl, st in zip(
+                (avg_l, p50_l, p95_l, p99_l), band_styles,
+            ) if lvl >= mid]
+            style = min(covers, key=lambda x: x[0])[1] if covers else "dim"
+            row.append(ch, style=style)
+        rows.append(row)
+
+    return rows, 0.0, t_hi
 
 
 def format_bytes(n: int) -> str:
@@ -789,7 +880,11 @@ def render_dashboard(snap: dict, cfg: Config, target_eps: float) -> Panel:
         avg_s = f"{avg:.2f}" if isinstance(avg, (int, float)) else "—"
         def n(key: str) -> str:
             v = tl.get(key)
-            return hi(v) if v is not None else "—"
+            if v is None:
+                return "—"
+            if isinstance(v, float):
+                return hi(f"{v:.2f}")
+            return hi(v)
         stats.add_row(
             "Table latency (15m):",
             f"avg {hi(avg_s)}s  p50 {n('p50_latency_sec')}s  "
@@ -800,60 +895,111 @@ def render_dashboard(snap: dict, cfg: Config, target_eps: float) -> Panel:
         )
 
     hist = snap["history"]
-    label_w = 11   # "  1234.5 ms"
+    table_hist = snap.get("table_history", [])
+    label_w = 11   # "  1234.5 ms" / "    1.50 s"
     side_pad = 1   # one blank column each side of the graph
     # Panel chrome = 2 border chars + 2 default horizontal padding chars.
-    # Row layout: [label][ ][side_pad][graph][side_pad]
     panel_chrome = 4
+    middle_gap = "   "  # spacing between the two halves
+    # Per-half row layout: [label][space*(side_pad+1)][graph][space*side_pad]
+    half_chrome = label_w + (side_pad + 1) + side_pad
     term_w = console.size.width or 120
-    graph_width = max(20, term_w - label_w - 1 - 2 * side_pad - panel_chrome)
+    graph_width = max(20, (term_w - panel_chrome - 2 * half_chrome - len(middle_gap)) // 2)
     graph_height = 12
 
-    rows, y_min, y_max = latency_graph(
+    probe_rows, p_ymin, p_ymax = latency_graph(
         hist, width=graph_width, height=graph_height, use_log=True,
     )
+    table_rows, t_ymin, t_ymax = multi_band_graph(
+        table_hist, width=graph_width, height=graph_height,
+    )
+    if not probe_rows:
+        probe_rows = [Text(" " * graph_width, style="dim") for _ in range(graph_height)]
+    if not table_rows:
+        table_rows = [Text(" " * graph_width, style="dim") for _ in range(graph_height)]
 
-    def fmt_y(v: float) -> str:
+    def fmt_y(v: float, unit: str) -> str:
+        # Right-align into label_w including the unit suffix.
+        num_w = max(1, label_w - 1 - len(unit))
         if v >= 1000:
-            return f"{v:8.0f} ms"
+            return f"{v:>{num_w}.0f} {unit}"
         if v >= 10:
-            return f"{v:8.1f} ms"
-        return f"{v:8.2f} ms"
+            return f"{v:>{num_w}.1f} {unit}"
+        return f"{v:>{num_w}.2f} {unit}"
 
-    left_gutter = " " * (side_pad + 1)   # separator + blank-column padding
+    def build_labels(rows, y_min, y_max, unit, *, log_scale):
+        if not rows or (y_min == 0.0 and y_max == 0.0):
+            return [" " * label_w] * len(rows)
+        mid_idx = len(rows) // 2
+        if log_scale:
+            mid_val = 10 ** ((math.log10(max(y_min, 1e-3)) + math.log10(max(y_max, 1e-3))) / 2)
+        else:
+            mid_val = (y_min + y_max) / 2
+        out = []
+        for i in range(len(rows)):
+            if i == 0:
+                out.append(fmt_y(y_max, unit))
+            elif i == len(rows) - 1:
+                out.append(fmt_y(y_min, unit))
+            elif i == mid_idx:
+                out.append(fmt_y(mid_val, unit))
+            else:
+                out.append(" " * label_w)
+        return out
+
+    left_gutter = " " * (side_pad + 1)
     right_gutter = " " * side_pad
+    half_w = label_w + (side_pad + 1) + graph_width + side_pad
+
+    def center_title(s: str, w: int) -> str:
+        s = s if len(s) <= w else s[: max(0, w)]
+        pad = (w - len(s)) // 2
+        return " " * pad + s + " " * (w - len(s) - pad)
+
+    titles = Text(
+        center_title("Probe latency (ms, per-batch avg / max)", half_w)
+        + middle_gap
+        + center_title("Table latency (s, event_time → file_modification_time)", half_w),
+        style="bold dim",
+    )
+
+    p_labels = build_labels(probe_rows, p_ymin, p_ymax, "ms", log_scale=True)
+    t_labels = build_labels(table_rows, t_ymin, t_ymax, "s", log_scale=False)
 
     labeled_rows: list[Text] = []
-    if rows:
-        mid_idx = len(rows) // 2
-        for i, row in enumerate(rows):
-            if i == 0:
-                label = fmt_y(y_max)
-            elif i == len(rows) - 1:
-                label = fmt_y(y_min)
-            elif i == mid_idx:
-                # Geometric midpoint on a log scale.
-                mid_val = 10 ** ((math.log10(max(y_min, 0.01)) + math.log10(max(y_max, 0.01))) / 2)
-                label = fmt_y(mid_val)
-            else:
-                label = " " * label_w
-            labeled_rows.append(
-                Text(label + left_gutter, style="dim") + row + Text(right_gutter)
-            )
-    else:
-        labeled_rows.append(Text("(no samples yet)", style="dim"))
+    for i in range(graph_height):
+        labeled_rows.append(
+            Text(p_labels[i] + left_gutter, style="dim")
+            + probe_rows[i]
+            + Text(right_gutter + middle_gap)
+            + Text(t_labels[i] + left_gutter, style="dim")
+            + table_rows[i]
+            + Text(right_gutter)
+        )
 
-    # Footer rule + legend aligned to the same gutter as the graph rows.
+    half_rule = "─" * graph_width
     gutter_prefix = " " * label_w + left_gutter
-    rule = Text(gutter_prefix + "─" * graph_width + right_gutter, style="dim")
+    rule = Text(
+        gutter_prefix + half_rule + right_gutter
+        + middle_gap
+        + gutter_prefix + half_rule + right_gutter,
+        style="dim",
+    )
     legend = Text.assemble(
         (gutter_prefix, "dim"),
+        ("probe ", "dim"),
         ("█ avg  ", AVG_STYLE),
-        ("█ max  ", MAX_STYLE),
-        ("log scale, 1 column = 1 probe batch, newest →   ", "dim"),
-        (f"probes: {len(hist)}", "dim"),
+        ("█ max     ", MAX_STYLE),
+        ("table ", "dim"),
+        ("█ avg  ", AVG_STYLE),
+        ("█ p50  ", P50_STYLE),
+        ("█ p95  ", P95_STYLE),
+        ("█ p99  ", P99_STYLE),
+        ("   ", "dim"),
+        ("probe: log scale  table: linear from 0   newest →   ", "dim"),
+        (f"probes: {len(hist)}  table queries: {len(table_hist)}", "dim"),
     )
-    graph_block = Group(*labeled_rows, rule, legend)
+    graph_block = Group(titles, *labeled_rows, rule, legend)
 
     body: list[Any] = [stats, Text(""), graph_block]
     if snap["last_error"]:
@@ -1237,24 +1383,31 @@ def _execute_sql(w, warehouse_id: str, sql: str) -> None:
     logger.info("SQL succeeded: %s", state)
 
 
+# Latency in seconds with microsecond precision, rounded to 2 decimals
+# (10ms granularity). The window length is plugged in at format time.
 _TABLE_LATENCY_SQL = """
 SELECT
-  count(*)                                                                                       AS total_rows,
-  min(event_time)                                                                                AS earliest_event,
-  max(event_time)                                                                                AS latest_event,
-  round(avg(unix_timestamp(_metadata.file_modification_time) - unix_timestamp(event_time)), 2)   AS avg_latency_sec,
-  min(unix_timestamp(_metadata.file_modification_time)   - unix_timestamp(event_time))           AS min_latency_sec,
-  max(unix_timestamp(_metadata.file_modification_time)   - unix_timestamp(event_time))           AS max_latency_sec,
-  percentile_approx(unix_timestamp(_metadata.file_modification_time) - unix_timestamp(event_time), 0.5)  AS p50_latency_sec,
-  percentile_approx(unix_timestamp(_metadata.file_modification_time) - unix_timestamp(event_time), 0.95) AS p95_latency_sec,
-  percentile_approx(unix_timestamp(_metadata.file_modification_time) - unix_timestamp(event_time), 0.99) AS p99_latency_sec
+  count(*)                                                                                                                      AS total_rows,
+  min(event_time)                                                                                                               AS earliest_event,
+  max(event_time)                                                                                                               AS latest_event,
+  round(avg              ((unix_micros(_metadata.file_modification_time) - unix_micros(event_time)) / 1000000.0     ), 2)       AS avg_latency_sec,
+  round(min              ((unix_micros(_metadata.file_modification_time) - unix_micros(event_time)) / 1000000.0     ), 2)       AS min_latency_sec,
+  round(max              ((unix_micros(_metadata.file_modification_time) - unix_micros(event_time)) / 1000000.0     ), 2)       AS max_latency_sec,
+  round(percentile_approx((unix_micros(_metadata.file_modification_time) - unix_micros(event_time)) / 1000000.0, 0.5 ), 2)      AS p50_latency_sec,
+  round(percentile_approx((unix_micros(_metadata.file_modification_time) - unix_micros(event_time)) / 1000000.0, 0.95), 2)      AS p95_latency_sec,
+  round(percentile_approx((unix_micros(_metadata.file_modification_time) - unix_micros(event_time)) / 1000000.0, 0.99), 2)      AS p99_latency_sec
 FROM {table}
-WHERE event_time >= current_timestamp() - INTERVAL 15 MINUTES
+WHERE event_time >= current_timestamp() - INTERVAL {window_seconds} SECONDS
 """.strip()
 
 
-def _query_table_latency(w, warehouse_id: str, table_name: str) -> Optional[dict]:
+def _query_table_latency(
+    w, warehouse_id: str, table_name: str, window_seconds: int,
+) -> Optional[dict]:
     """Run the ingest-latency query against the target table.
+
+    `window_seconds` is the WHERE-clause lookback (e.g. 30 for the graph,
+    900 for the summary).
 
     Returns a dict of named values, or None if the query failed/timed out.
     Bounded by a 15s warehouse-side timeout so we never block streaming.
@@ -1262,7 +1415,9 @@ def _query_table_latency(w, warehouse_id: str, table_name: str) -> Optional[dict
     from databricks.sdk.service.sql import (
         ExecuteStatementRequestOnWaitTimeout, StatementState,
     )
-    sql = _TABLE_LATENCY_SQL.format(table=table_name)
+    sql = _TABLE_LATENCY_SQL.format(
+        table=table_name, window_seconds=int(window_seconds),
+    )
     try:
         resp = w.statement_execution.execute_statement(
             warehouse_id=warehouse_id,
@@ -1282,18 +1437,18 @@ def _query_table_latency(w, warehouse_id: str, table_name: str) -> Optional[dict
             return None
         out: dict[str, Any] = dict(zip(cols, row))
         # Numeric fields come back as strings via the JSON-array result format.
-        for k in ("total_rows", "min_latency_sec", "max_latency_sec",
+        if out.get("total_rows") is not None:
+            try:
+                out["total_rows"] = int(float(out["total_rows"]))
+            except (TypeError, ValueError):
+                pass
+        for k in ("avg_latency_sec", "min_latency_sec", "max_latency_sec",
                   "p50_latency_sec", "p95_latency_sec", "p99_latency_sec"):
             if out.get(k) is not None:
                 try:
-                    out[k] = int(float(out[k]))
+                    out[k] = float(out[k])
                 except (TypeError, ValueError):
                     pass
-        if out.get("avg_latency_sec") is not None:
-            try:
-                out["avg_latency_sec"] = float(out["avg_latency_sec"])
-            except (TypeError, ValueError):
-                pass
         return out
     except Exception as e:
         logger.warning("table-latency query failed: %s", e)
@@ -1433,28 +1588,36 @@ def run_feeder(cfg: Config) -> None:
                                 last_logged_error = msg
                     stats.record_probe_batch(latencies)
 
-                    # Run the ingest-latency query before switching back to
+                    # Run the ingest-latency queries before switching back to
                     # non-blocking sends, so timing is taken at a quiet moment.
+                    # Two separate windows: 30s for the high-resolution graph,
+                    # 15m for the stable summary row in the dashboard header.
                     if tl_client is not None:
                         stats.set_phase("querying")
                         live.update(render_dashboard(stats.snapshot(), cfg, target_eps))
                         last_ui_update = time.perf_counter()
-                        tl_result = _query_table_latency(
-                            tl_client, cfg.warehouse_id, cfg.table_name,
-                        )
-                        if tl_result:
-                            stats.record_table_latency(tl_result)
-                            logger.info(
-                                "table-latency rows=%s avg=%ss min=%ss max=%ss "
-                                "p50=%ss p95=%ss p99=%ss",
-                                tl_result.get("total_rows"),
-                                tl_result.get("avg_latency_sec"),
-                                tl_result.get("min_latency_sec"),
-                                tl_result.get("max_latency_sec"),
-                                tl_result.get("p50_latency_sec"),
-                                tl_result.get("p95_latency_sec"),
-                                tl_result.get("p99_latency_sec"),
+                        for label, window_s, recorder in (
+                            ("30s",  30,       stats.record_table_latency_graph),
+                            ("15m",  15 * 60,  stats.record_table_latency_summary),
+                        ):
+                            res = _query_table_latency(
+                                tl_client, cfg.warehouse_id, cfg.table_name,
+                                window_seconds=window_s,
                             )
+                            if res:
+                                recorder(res)
+                                logger.info(
+                                    "table-latency[%s] rows=%s avg=%ss min=%ss max=%ss "
+                                    "p50=%ss p95=%ss p99=%ss",
+                                    label,
+                                    res.get("total_rows"),
+                                    res.get("avg_latency_sec"),
+                                    res.get("min_latency_sec"),
+                                    res.get("max_latency_sec"),
+                                    res.get("p50_latency_sec"),
+                                    res.get("p95_latency_sec"),
+                                    res.get("p99_latency_sec"),
+                                )
 
                     next_probe_at = time.perf_counter() + probe_every_secs
                     next_send = time.perf_counter()

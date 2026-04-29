@@ -1532,6 +1532,9 @@ def run_feeder(cfg: Config) -> None:
             tl_client = None
 
     stats = Stats()
+    # Cycle: non-blocking push → probe → table-latency → repeat. Start in
+    # the streaming phase so the dashboard reflects what's actually happening.
+    stats.set_phase("streaming")
     stop = threading.Event()
     stop_reason = {"value": "normal exit"}
 
@@ -1549,7 +1552,9 @@ def run_feeder(cfg: Config) -> None:
 
     probe_count = 10
     probe_every_secs = 10.0
-    next_probe_at = time.perf_counter()  # probe immediately on start
+    # Stream first; defer the first probe by one full interval so the
+    # table-latency query at the end of the cycle has data to query.
+    next_probe_at = time.perf_counter() + probe_every_secs
     last_ui_update = 0.0
     ui_refresh_secs = 0.2
 
